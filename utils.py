@@ -185,6 +185,38 @@ def corr_from_labels(labels: Array) -> Array:
     C = np.outer(labels, labels)
     return C
 
+
+def mean_M_cross_within_pairs(M: Array, Cbar: Array) -> Tuple[float, float]:
+    """
+    Average off-diagonal entries of ``M`` on within-group vs cross-group pairs,
+    where groups follow the sign pattern of ``Cbar`` (e.g. ``Cbar = outer(l, l)`` with
+    ``l in {-1, +1}`` gives ``C_ij = +1`` within a group and ``-1`` across groups).
+
+    For ``polarization``-style ``Cbar`` (all +1 off-diagonals), every pair is treated
+    as within-group and the cross-group mean is ``nan``.
+    """
+    M = np.asarray(M, dtype=np.float64)
+    Cbar = np.asarray(Cbar, dtype=np.float64)
+    n = M.shape[0]
+    if n < 2:
+        return float("nan"), float("nan")
+    iu = np.triu_indices(n, k=1)
+    cij = Cbar[iu]
+    mij = M[iu]
+    cross = mij[cij < -1e-9]
+    within = mij[cij > 1e-9]
+    mean_cross = float(np.mean(cross)) if cross.size else float("nan")
+    mean_within = float(np.mean(within)) if within.size else float("nan")
+    return mean_cross, mean_within
+
+
+def edge_inter_intra_bucket(u: int, v: int, Cbar: Array) -> str:
+    """Return ``'inter'`` or ``'intra'`` for edge ``(u, v)`` using the sign of ``Cbar[u, v]``."""
+    c = float(Cbar[int(u), int(v)])
+    if c < -1e-9:
+        return "inter"
+    return "intra"
+
 def top_eigenpair(A, tol=1e-6, max_iter=200):
     """
     Largest eigenpair of (approximately) symmetric A.
@@ -229,36 +261,18 @@ def project_psd(A: np.ndarray, eps: Optional[float] = None) -> np.ndarray:
 
 
 def enforce_unit_diagonal(C):
-    """
-    Set diag(C) = 1.
-    """
     C = C.copy()
     np.fill_diagonal(C, 1.0)
     return C
 
-
-def project_spectral_ball(C: np.ndarray, Cbar: np.ndarray, rho: float) -> np.ndarray:
-    """
-    Project C onto the spectral ball {X : ||X - Cbar||_2 <= rho}
-    by clipping eigenvalues of (C - Cbar).
-    """
-    M = C - Cbar
-    w, U = np.linalg.eigh(M)
-    w_clipped = np.clip(w, -rho, rho)
-    M_proj = (U * w_clipped) @ U.T
-    return Cbar + M_proj
-
-def project_box_constraint(C: np.ndarray, Cbar: np.ndarray, rho: float) -> np.ndarray:
+def project_box_constraint(C: np.ndarray, Cbar: np.ndarray, limit: float = 1.0) -> np.ndarray:
     # project non diagonal elements of C onto the box [-rho, rho]
     M = C - Cbar
-    M = np.clip(M, -rho, rho)
+    M = np.clip(M, -limit, limit)
     return Cbar + M
 
 
-def project_to_correlation(A, n_iters=20, eps=1e-10):
-    """
-    Approximate projection onto {C PSD, diag(C)=1}.
-    """
+def project_to_correlation(A: np.ndarray, n_iters: int = 20, eps: float = 1e-10) -> np.ndarray:
     X = 0.5 * (A + A.T)
     for _ in range(n_iters):
         # PSD projection
@@ -273,104 +287,73 @@ def project_to_correlation(A, n_iters=20, eps=1e-10):
     return X
 
 
-def project_onto_U(C: np.ndarray, Cbar: np.ndarray, rho: float, n_rounds: int = 5, norm_constraint: str = 'spectral_ball') -> np.ndarray:
+def project_onto_U(C: np.ndarray, Cbar: np.ndarray, rho: float, n_rounds: int = 5, norm_constraint: str = 'classifier_error') -> np.ndarray:
 
     X = C.copy()
-    for _ in range(n_rounds):
-        X = project_psd(X)
-        X = enforce_unit_diagonal(X)
-        if norm_constraint == 'spectral_ball':
-            X = project_spectral_ball(X, Cbar, rho)
-        elif norm_constraint == 'box_constraint':
-            X = project_box_constraint(X, Cbar, rho)
-        elif norm_constraint == 'unit_diagonal':
-            break
-        else:
-            raise ValueError(f"Invalid norm constraint: {norm_constraint}")
-    # final cleanup
-    X = 0.5 * (X + X.T)
-    X = project_psd(X)
-    X = enforce_unit_diagonal(X)
+   
+   
     return X
-
 
 def worst_case_C_for_fixed_L(
     L: np.ndarray,
     X: np.ndarray,
     Cbar: np.ndarray,
     rho: float,
-    T_C: int = 20,
-    step0: float = 1.0,
-    tol: float = 1e-5,
-    C0: Optional[np.ndarray] = None,
-    norm_constraint: str = 'spectral_ball',
-    s: Optional[np.ndarray] = None
-) -> np.ndarray:
-    """
-    Approximately solve:
-        max_{C in U} lambda_max( X ⊙ C )
-    where X = (I + L)^(-1) is kept implicit/updated elsewhere.
-
-    If ``C0`` is given (feasible correlation in U), subgradient ascent starts there; otherwise from ``Cbar``.
-    """
-    start_time = time.time()
+    C_prev: Optional[np.ndarray] = None,
+    s: Optional[np.ndarray] = None,
+    n_steps: int = 5,
+) -> Tuple[np.ndarray, float]:
     n = L.shape[0]
+    q = 4 * rho * (1 - rho)
+    start_time = time.time()
 
-    C = Cbar.copy() if C0 is None else np.asarray(C0, dtype=np.float64).copy()
-    prev_val = -np.inf
-
-    progress_bar = tqdm(range(T_C))
-
-    if s is None:
-        initial_val, v = top_eigenpair(X * C)
+    if C_prev is None:
+        C = Cbar.copy()
     else:
-        v = s
+        C = C_prev.copy()
 
-    initial_val = v.T @ (X * C) @ v
 
-    for t in progress_bar:
-        Z = X * C  # Hadamard product
+    if s is not None:
+        v = s.copy()
+        lam = s.T @ (X * C) @ s
+    else:
+        lam, v = top_eigenpair(X * C)
 
-        if s is None:
-            lam, v = top_eigenpair(Z)
+        v = v.copy()
+
+    C_init = C.copy()
+
+    lam_prev = lam
+
+    for step in range(n_steps):
+        # Frank-Wolfe: move toward extreme point of box in gradient direction
+        G = X * np.outer(v, v)       # gradient w.r.t. C
+        C = C + q * np.sign(G)       # full step to box extreme point
+        
+        # Project back onto U
+        C = project_box_constraint(C, Cbar, q)
+        C = project_psd(C)
+        C = project_box_constraint(C, Cbar, q)  # re-enforce after PSD
+        C = enforce_unit_diagonal(C)
+
+        # Recompute eigenpair at new C
+        if s is not None:
+            lam = s.T @ (X * C) @ s
         else:
-            v = s
+            lam, v = top_eigenpair(X * C)
 
-        # Subgradient of lambda_max(X ⊙ C) w.r.t. C
-        G = X * np.outer(v, v)
 
-        # Step size schedule
-        # eta = step0 / np.sqrt(t + 1)
-        eta = step0
-
-        # Ascent step
-        C_hat = C + eta * G
-
-        # Projection back to U
-        C_new = project_onto_U(C_hat, Cbar, rho, n_rounds=5, norm_constraint=norm_constraint)
-
-        # stopping criterion
-        new_val = v.T @ (X * C_new) @ v
-        if abs(new_val - prev_val) < tol:
-            C = C_new
+        if np.isclose(lam, lam_prev, rtol=1e-10):
             break
 
-        C = C_new
-        prev_val = new_val
-
-        progress_bar.set_description(f"Percent Change: {(new_val - initial_val) / (initial_val + 1e-10) * 100:.2f}%")
-        progress_bar.refresh()
-        progress_bar.update(1)
-
-    progress_bar.close()
+        lam_prev = lam
 
     eta_time = time.time() - start_time
-
+    
     return C, eta_time
 
 
 def sketch_solve(A: sp.csr_matrix, R: np.ndarray) -> np.ndarray:
-    """Solve A U = R column-wise (e.g. CG). R is (n, q). Returns U with same shape."""
     n, q = R.shape
     if A.shape[0] != n:
         raise ValueError("A and R must agree in row dimension.")
@@ -388,11 +371,6 @@ def sketch_U_sherman_morrison_two_rank(
     c: np.ndarray,
     denom_eps: float = 1e-14,
 ) -> np.ndarray:
-    """
-    Update sketch U when (I+L) becomes A' = A + w a a^T - w c c^T, with U ≈ A^{-1} R and
-    X = A^{-1} ≈ (1/q) U U^T. Two Sherman–Morrison steps: A_1 = A + u u^T (u = sqrt(w) a),
-    then A' = A_1 - z z^T (z = sqrt(w) c).
-    """
     if w == 0.0:
         return U
     u_vec = np.sqrt(w) * np.asarray(a, dtype=np.float64).ravel()
@@ -692,35 +670,7 @@ def saturate_fast_helper(oracles: List[ScenarioOracle], ground_set: List[int], t
 
     return best_S, best_c
 
-
-def spectral_extreme(C_bar, rho, sign=1):
-    w, V = np.linalg.eigh(0.5 * (C_bar + C_bar.T))
-    idx = np.argsort(-w)
-
-    H = np.outer(V[:, idx[0]], V[:, idx[0]])
-    np.fill_diagonal(H, 0.0)
-
-    C = C_bar + sign * rho * H
-    C = project_to_correlation(C)
-    return C
-
-def random_low_rank(C_bar, rho, rank=2):
-    n = C_bar.shape[0]
-
-    U = np.random.randn(n, rank)
-    H = U @ U.T
-    H = 0.5 * (H + H.T)
-    np.fill_diagonal(H, 0.0)
-
-    H = H / np.linalg.norm(H, 2)
-
-    C = C_bar + rho * H
-    C = project_to_correlation(C)
-
-    return C
-
-def generate_correlation_matrix_scenario(Cbar, mode, **kwargs):
-
+def generate_correlation_matrix_scenario(Cbar: np.ndarray, mode: str, **kwargs) -> np.ndarray:
     if mode == 'classifier_error':
         if 'p' in kwargs:
             p = kwargs['p']
@@ -740,24 +690,6 @@ def generate_correlation_matrix_scenario(Cbar, mode, **kwargs):
             raise ValueError("epsilon must be provided")
         p = 1 / (1 + np.exp(epsilon))
         return generate_correlation_matrix_scenario(Cbar, mode='classifier_error', p=p)
-
-    elif mode == 'random_low_rank':
-        if 'rho' in kwargs:
-            rho = kwargs['rho']
-        else:
-            raise ValueError("rho must be provided")
-        n = Cbar.shape[0]
-        rank = kwargs.get('rank', 2)
-        C = random_low_rank(Cbar, rho, rank)
-
-    elif mode == 'spectral_extreme':
-        if 'rho' in kwargs:
-            rho = kwargs['rho']
-        else:
-            raise ValueError("rho must be provided")
-        sign = kwargs.get('sign', 1)
-        C = spectral_extreme(Cbar, rho, sign=sign)
-
     else:
         raise ValueError(f"Invalid mode: {mode}")
 

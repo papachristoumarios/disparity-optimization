@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
+from re import S
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
@@ -18,17 +19,103 @@ import os
 rng = np.random.default_rng(0)
 
 sns.set_theme(style="whitegrid")
-sns.set_palette("deep")
 
-FIGSIZE = 4
+# set palette to viridis
+sns.set_palette('magma')
+
+FIGSIZE = 5
+
+# set font scale to 1.5
+sns.set(font_scale=1.5)
+
+
+
+def _pct_change_vs_ref(curr: float, ref: float) -> float:
+    if not np.isfinite(curr):
+        return 0.0
+    if not np.isfinite(ref) or abs(ref) < 1e-20:
+        return 0.0
+    return float((curr - ref) / (abs(ref) + 1e-14) * 100.0)
+
+
+def _append_auxiliary_inner_records(
+    records: List[dict],
+    i: int,
+    M: np.ndarray,
+    Cbar_for_groups: Optional[np.ndarray],
+    cum_abs_weight: float,
+    edges_removed_cum: int,
+    intra_abs_cum: float,
+    inter_abs_cum: float,
+    init_mean_cross: float,
+    init_mean_within: float,
+    initial_edge_mass: float,
+    initial_num_edges: int,
+) -> None:
+    """Append cross/within influence, churn, and inter/intra weight-Δ rows (one row per metric)."""
+    if Cbar_for_groups is None:
+        return
+    mc, mw = mean_M_cross_within_pairs(M, Cbar_for_groups)
+    records.append(
+        {
+            "Step": i,
+            "Metric": "Mean M cross-group",
+            "Percent Change": _pct_change_vs_ref(mc, init_mean_cross),
+            "Value": mc,
+        }
+    )
+    records.append(
+        {
+            "Step": i,
+            "Metric": "Mean M within-group",
+            "Percent Change": _pct_change_vs_ref(mw, init_mean_within),
+            "Value": mw,
+        }
+    )
+    den_m = initial_edge_mass + 1e-14
+    den_e = float(initial_num_edges) + 1e-14
+    records.append(
+        {
+            "Step": i,
+            "Metric": "Intervention churn (cum. abs Δw)",
+            "Percent Change": float(100.0 * cum_abs_weight / den_m),
+            "Value": float(cum_abs_weight),
+        }
+    )
+    records.append(
+        {
+            "Step": i,
+            "Metric": "Edges removed (cumulative)",
+            "Percent Change": float(100.0 * edges_removed_cum / den_e),
+            "Value": float(edges_removed_cum),
+        }
+    )
+    records.append(
+        {
+            "Step": i,
+            "Metric": "Intra-group abs weight Δ (cum.)",
+            "Percent Change": float(100.0 * intra_abs_cum / den_m),
+            "Value": float(intra_abs_cum),
+        }
+    )
+    records.append(
+        {
+            "Step": i,
+            "Metric": "Inter-group abs weight Δ (cum.)",
+            "Percent Change": float(100.0 * inter_abs_cum / den_m),
+            "Value": float(inter_abs_cum),
+        }
+    )
 
 def get_datasets(args: argparse.Namespace):
     if args.size == 'tiny':
         datasets = [('reddit', ['random'])]
     elif args.size == 'small':
-        datasets = [('reddit', ['random']), ('twitter', ['random']), ('polblogs', ['random'])]
+        datasets = [('reddit', ['spectral', 'polarization']), ('twitter', ['spectral', 'polarization']), ('polblogs', ['spectral', 'polarization'])]
     elif args.size == 'all':
-        datasets = [('twitter', ['spectral', 'label', 'polarization', 'random']), ('polblogs', ['spectral', 'label', 'polarization', 'random']), ('reddit', ['spectral', 'label', 'polarization', 'random'])]
+        datasets = [('twitter', ['spectral', 'label', 'polarization', 'random']), 
+                    ('polblogs', ['spectral', 'label', 'polarization', 'random']), 
+                    ('reddit', ['spectral', 'label', 'polarization', 'random'])]
     else:
         raise ValueError(f"Invalid size: {args.size}")
 
@@ -36,27 +123,26 @@ def get_datasets(args: argparse.Namespace):
     
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--experiment_list', type=str, nargs='+', default=['1-8'])
     parser.add_argument("--out-dir", type=str, default='figures')
     parser.add_argument("--rho", type=float, default=1.0)
-    parser.add_argument("--k", type=int, default=10)
     parser.add_argument('--eta', type=float, default=1.0)
     parser.add_argument('--batch_size', type=int, default=100)
     parser.add_argument('--eps', type=float, default=0.1)
-    parser.add_argument('--T', type=int, default=100)
-    parser.add_argument('--K', type=int, default=10)
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--b', type=int, default=100)
     parser.add_argument('--size', default='all', choices=['all', 'small', 'tiny'])
+    parser.add_argument('--s_type', default='actual', choices=['actual', 'adversarial'])
     parser.add_argument(
         '--betweenness-refresh',
         type=int,
         default=1,
         help='Recompute edge betweenness every k steps (1 = every step; larger speeds up max-betweenness baseline).',
     )
+    parser.add_argument('--cached_results', action='store_true')
     return parser.parse_args()
 
 
-def robust_link_recommendation(G: nx.Graph, Cbar: np.ndarray, rho: float, name: str, q: int, norm_constraint: str = 'spectral_ball', K: int = 10, T_L: int = 50, T_C: int = 20, eta_L: float = 1.0, eta_C: float = 2.0, batch_size: int = 100, seed: int = 0) -> None:
+def robust_link_recommendation(G: nx.Graph, Cbar: np.ndarray, rho: float, name: str, q: int, K: int = 10, T_L: int = 50, T_C: int = 20, eta_L: float = 1.0, eta_C: float = 2.0, batch_size: int = 100, seed: int = 0) -> None:
     L0 = sparse_laplacian(G)
     U0, X0 = sketch_solve_X(L0, q, rng)
     M0 = X0 @ X0
@@ -80,7 +166,6 @@ def robust_link_recommendation(G: nx.Graph, Cbar: np.ndarray, rho: float, name: 
         'Percent Change': 0.0,
         'Value': initial_surrogate_disparity,
         'k' : 0,
-        'Norm Constraint': norm_constraint,
         'Rho': rho,
         'Number of Nodes': n,
     })
@@ -90,7 +175,6 @@ def robust_link_recommendation(G: nx.Graph, Cbar: np.ndarray, rho: float, name: 
         'Percent Change': 0.0,
         'Value': initial_disparity,
         'k' : 0,
-        'Norm Constraint': norm_constraint,
         'Rho': rho,
         'Number of Nodes': n,
     })
@@ -100,22 +184,54 @@ def robust_link_recommendation(G: nx.Graph, Cbar: np.ndarray, rho: float, name: 
         'Percent Change': 0.0,
         'Value': initial_polarization,
         'k' : 0,
-        'Norm Constraint': norm_constraint,
         'Rho': rho,
         'Number of Nodes': n,
     })
+    cbar_fro = float(np.linalg.norm(Cbar, "fro"))
+    cbar_spec = float(np.linalg.norm(Cbar, 2))
+    records_outer.append(
+        {
+            "Name": name,
+            "Metric": "C deviation Frobenius",
+            "Percent Change": 0.0,
+            "Value": 0.0,
+            "k": 0,
+            "Rho": rho,
+            "Number of Nodes": n,
+        }
+    )
+    records_outer.append(
+        {
+            "Name": name,
+            "Metric": "C deviation spectral",
+            "Percent Change": 0.0,
+            "Value": 0.0,
+            "k": 0,
+            "Rho": rho,
+            "Number of Nodes": n,
+        }
+    )
 
     eta_time = 0
 
     for k in range(K):
         C0, L0, M0, X0, worst_surrogate_disparity_current, worst_disparity_current, worst_polarization_current = active_set[-1]
 
-        df_inner, L, X, M, H, L_eta_time = link_recommendation(G=G, C=C0, s=None, name=name, T_L=T_L, batch_size=batch_size, eta=eta_L, seed=seed)
+        df_inner, L, X, M, H, L_eta_time = link_recommendation(
+            G=G,
+            C=C0,
+            s=None,
+            name=name,
+            T_L=T_L,
+            batch_size=batch_size,
+            eta=eta_L,
+            seed=seed,
+            Cbar_for_groups=Cbar,
+        )
         records_inner.append(df_inner)
         eta_time += L_eta_time
 
-        
-        C_new, C_eta_time = worst_case_C_for_fixed_L(L=L, X=X, Cbar=Cbar, rho=rho, norm_constraint=norm_constraint, T_C=T_C, C0=C0, step0=eta_C)
+        C_new, C_eta_time = worst_case_C_for_fixed_L(L=L, X=X, Cbar=Cbar, rho=rho, C_prev=C0)
 
         worst_surrogate_disparity_new = float(top_eigenpair(X * C_new)[0])
         worst_disparity_new = float(top_eigenpair(M * C_new)[0])
@@ -123,10 +239,17 @@ def robust_link_recommendation(G: nx.Graph, Cbar: np.ndarray, rho: float, name: 
 
         eta_time += C_eta_time
 
-        if worst_surrogate_disparity_new <= worst_surrogate_disparity_current:
+        if np.isclose(worst_surrogate_disparity_new, worst_surrogate_disparity_current, rtol=1e-6):
             break
 
+        print(
+            f"Worst case surrogate disparity improved from {worst_surrogate_disparity_current} "
+            f"to {worst_surrogate_disparity_new}"
+        )
+
         active_set.append((C_new, L, M, X, worst_surrogate_disparity_new, worst_disparity_new, worst_polarization_new))
+
+
 
         records_outer.append({
             'Name': name,
@@ -134,7 +257,6 @@ def robust_link_recommendation(G: nx.Graph, Cbar: np.ndarray, rho: float, name: 
             'Percent Change': (worst_surrogate_disparity_new - initial_surrogate_disparity) / initial_surrogate_disparity * 100,
             'Value': worst_surrogate_disparity_new,
             'k' : k + 1,
-            'Norm Constraint': norm_constraint,
             'Rho': rho,
             'Number of Nodes': n,
         })
@@ -144,7 +266,6 @@ def robust_link_recommendation(G: nx.Graph, Cbar: np.ndarray, rho: float, name: 
             'Percent Change': (worst_disparity_new - initial_disparity) / initial_disparity * 100,
             'Value': worst_disparity_new,
             'k' : k + 1,
-            'Norm Constraint': norm_constraint,
             'Rho': rho,
             'Number of Nodes': n,
         })
@@ -154,17 +275,51 @@ def robust_link_recommendation(G: nx.Graph, Cbar: np.ndarray, rho: float, name: 
             'Percent Change': (worst_polarization_new - initial_polarization) / initial_polarization * 100,
             'Value': worst_polarization_new,
             'k' : k + 1,
-            'Norm Constraint': norm_constraint,
             'Rho': rho,
             'Number of Nodes': n,
         })
+        diff_C = C_new - Cbar
+        dev_fro = float(np.linalg.norm(diff_C, "fro"))
+        dev_spec = float(np.linalg.norm(diff_C, 2))
+        records_outer.append(
+            {
+                "Name": name,
+                "Metric": "C deviation Frobenius",
+                "Percent Change": float(100.0 * dev_fro / (cbar_fro + 1e-14)),
+                "Value": dev_fro,
+                "k": k + 1,
+                "Rho": rho,
+                "Number of Nodes": n,
+            }
+        )
+        records_outer.append(
+            {
+                "Name": name,
+                "Metric": "C deviation spectral",
+                "Percent Change": float(100.0 * dev_spec / (cbar_spec + 1e-14)),
+                "Value": dev_spec,
+                "k": k + 1,
+                "Rho": rho,
+                "Number of Nodes": n,
+            }
+        )
 
     df_outer = pd.DataFrame(records_outer)
     df_inner = pd.concat(records_inner, ignore_index=True)
-    return df_outer, df_inner, eta_time
+    return df_outer, df_inner, eta_time, M0, M
 
 
-def link_recommendation(G: nx.Graph, s: np.ndarray, C: np.ndarray, name: str, T_L: int = 100, batch_size: int = 100, eta: float = 1, seed: int = 0) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, nx.Graph]:
+def link_recommendation(
+    G: nx.Graph,
+    s: np.ndarray,
+    C: np.ndarray,
+    name: str,
+    T_L: int = 100,
+    batch_size: int = 100,
+    eta: float = 1,
+    seed: int = 0,
+    Cbar_for_groups: Optional[np.ndarray] = None,
+) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, nx.Graph]:
     nodelist = list(G.nodes())
     B = nx.incidence_matrix(G, nodelist=nodelist, oriented=True).toarray()
     edge_to_col = {}
@@ -195,16 +350,35 @@ def link_recommendation(G: nx.Graph, s: np.ndarray, C: np.ndarray, name: str, T_
 
     progress_bar = tqdm(total=T_L, desc="Link Recommendations")
 
-    if s:   
+    if s is not None:
         initial_disparity = s.T @ (M * C) @ s
         initial_polarization = s.T @ M @ s
         initial_surrogate_disparity = s.T @ (X * C) @ s
+        s_type = 'actual'
     else:
-        initial_disparity = float(top_eigenpair(M * C)[0])
-        initial_polarization = float(top_eigenpair(M)[0])
-        initial_surrogate_disparity = float(top_eigenpair(X * C)[0])
+        initial_disparity, s = top_eigenpair(M * C)
+        initial_polarization, s = top_eigenpair(M)
+        initial_surrogate_disparity, s = top_eigenpair(X * C)
+        s_type = 'adversarial'
 
     initial_L0_fro = np.linalg.norm(L0, 'fro')
+
+    surrogate_disparity_prev = initial_surrogate_disparity
+
+    if Cbar_for_groups is not None:
+        init_mean_cross, init_mean_within = mean_M_cross_within_pairs(M, Cbar_for_groups)
+        initial_edge_mass = float(sum(float(H[u][v]["weight"]) for u, v in H.edges()))
+        initial_num_edges = int(H.number_of_edges())
+    else:
+        init_mean_cross = float("nan")
+        init_mean_within = float("nan")
+        initial_edge_mass = 0.0
+        initial_num_edges = 0
+
+    cum_abs_weight = 0.0
+    edges_removed_cum = 0
+    intra_abs_cum = 0.0
+    inter_abs_cum = 0.0
 
     # use tqdm to show progress
     for i in range(T_L):
@@ -227,12 +401,26 @@ def link_recommendation(G: nx.Graph, s: np.ndarray, C: np.ndarray, name: str, T_
         eta_current = eta / np.sqrt(i + 1)
         weight_change = max(0.0, min(eta_current, H[u_plus][v_plus]['weight'], H[u_minus][v_minus]['weight']))
 
+        if Cbar_for_groups is not None:
+            cum_abs_weight += 2.0 * weight_change
+            bp = edge_inter_intra_bucket(int(u_plus), int(v_plus), Cbar_for_groups)
+            bm = edge_inter_intra_bucket(int(u_minus), int(v_minus), Cbar_for_groups)
+            if bp == "intra":
+                intra_abs_cum += weight_change
+            else:
+                inter_abs_cum += weight_change
+            if bm == "intra":
+                intra_abs_cum += weight_change
+            else:
+                inter_abs_cum += weight_change
 
         # H is undirected; each edge has one shared weight dict.
         H[u_plus][v_plus]['weight'] += weight_change
         H[u_minus][v_minus]['weight'] -= weight_change
 
         if H[u_minus][v_minus]['weight'] <= 1e-12:
+            if Cbar_for_groups is not None:
+                edges_removed_cum += 1
             H.remove_edge(u_minus, v_minus)
 
         b_uv_plus = B[:, edge_to_col[edge_plus]].reshape((n, 1))
@@ -254,14 +442,18 @@ def link_recommendation(G: nx.Graph, s: np.ndarray, C: np.ndarray, name: str, T_
         Z_tilde = X * C
         Z = M * C
 
-        if s:
+        if s is not None:
             surrogate_disparity = s.T @ Z_tilde @ s
             disparity = s.T @ Z @ s
             polarization = s.T @ M @ s
         else:
-            surrogate_disparity = float(top_eigenpair(Z_tilde)[0])
-            disparity = float(top_eigenpair(Z)[0])
-            polarization = float(top_eigenpair(M)[0])
+            surrogate_disparity, s = top_eigenpair(Z_tilde)
+            disparity, s = top_eigenpair(Z)
+            polarization, s = top_eigenpair(M)
+        
+
+        if np.isclose(surrogate_disparity, surrogate_disparity_prev, rtol=1e-6):
+            break
         
         diff_L_fro = np.linalg.norm(L - L0, 'fro') / initial_L0_fro * 100
 
@@ -287,9 +479,26 @@ def link_recommendation(G: nx.Graph, s: np.ndarray, C: np.ndarray, name: str, T_
             'Percent Change': diff_L_fro,
         })
 
-        progress_bar.set_description(f"Name: {name}, S: {surrogate_disparity:.2g}, D: {disparity:.2g}, P: {polarization:.2g}")
+        _append_auxiliary_inner_records(
+            records,
+            i,
+            M,
+            Cbar_for_groups,
+            cum_abs_weight,
+            edges_removed_cum,
+            intra_abs_cum,
+            inter_abs_cum,
+            init_mean_cross,
+            init_mean_within,
+            initial_edge_mass,
+            initial_num_edges,
+        )
+
+        progress_bar.set_description(f"Name: {name}, S: {surrogate_disparity}, D: {disparity}, P: {polarization}")
         progress_bar.update(1)
         progress_bar.refresh()
+
+        surrogate_disparity_prev = surrogate_disparity
 
     eta_time = time.time() - start_time
 
@@ -608,6 +817,7 @@ def generalized_link_reweighting(
     selection: str = "leverage",
     track_fiedler: bool = False,
     betweenness_refresh: int = 1,
+    Cbar_for_groups: Optional[np.ndarray] = None,
 ) -> Tuple[pd.DataFrame, sp.csr_matrix, np.ndarray, np.ndarray, nx.Graph, float]:
     """
     Same mass-transfer dynamics as ``link_recommendation`` / ``fiedler_maximizing_link_recommendation``,
@@ -666,6 +876,20 @@ def generalized_link_reweighting(
 
     initial_L0_fro = float(sp.linalg.norm(L0, "fro"))
 
+    if Cbar_for_groups is not None:
+        init_mean_cross, init_mean_within = mean_M_cross_within_pairs(M, Cbar_for_groups)
+        initial_edge_mass = float(sum(float(H[u][v]["weight"]) for u, v in H.edges()))
+        initial_num_edges = int(H.number_of_edges())
+    else:
+        init_mean_cross = float("nan")
+        init_mean_within = float("nan")
+        initial_edge_mass = 0.0
+        initial_num_edges = 0
+    cum_abs_weight = 0.0
+    edges_removed_cum = 0
+    intra_abs_cum = 0.0
+    inter_abs_cum = 0.0
+
     betweenness_cache: Optional[Dict[Tuple[int, int], float]] = None
     if selection == "max_betweenness" and betweenness_refresh <= 0:
         raise ValueError("betweenness_refresh must be >= 1")
@@ -712,10 +936,25 @@ def generalized_link_reweighting(
             ),
         )
 
+        if Cbar_for_groups is not None:
+            cum_abs_weight += 2.0 * weight_change
+            bp = edge_inter_intra_bucket(int(edge_plus[0]), int(edge_plus[1]), Cbar_for_groups)
+            bm = edge_inter_intra_bucket(int(edge_minus[0]), int(edge_minus[1]), Cbar_for_groups)
+            if bp == "intra":
+                intra_abs_cum += weight_change
+            else:
+                inter_abs_cum += weight_change
+            if bm == "intra":
+                intra_abs_cum += weight_change
+            else:
+                inter_abs_cum += weight_change
+
         H[edge_plus[0]][edge_plus[1]]["weight"] += weight_change
         H[edge_minus[0]][edge_minus[1]]["weight"] -= weight_change
 
         if H[edge_minus[0]][edge_minus[1]]["weight"] <= 1e-12:
+            if Cbar_for_groups is not None:
+                edges_removed_cum += 1
             H.remove_edge(edge_minus[0], edge_minus[1])
 
         b_uv_plus = B[:, edge_to_col[edge_plus]].reshape((n, 1))
@@ -829,9 +1068,23 @@ def generalized_link_reweighting(
             }
         )
 
-        lam2_s = f"{lam2_new:.4g}" if track_fiedler else ""
+        _append_auxiliary_inner_records(
+            records,
+            i,
+            M,
+            Cbar_for_groups,
+            cum_abs_weight,
+            edges_removed_cum,
+            intra_abs_cum,
+            inter_abs_cum,
+            init_mean_cross,
+            init_mean_within,
+            initial_edge_mass,
+            initial_num_edges,
+        )
+
         progress_bar.set_description(
-            f"{desc} | {name} λ2:{lam2_s} S:{surrogate_disparity:.2g} D:{disparity:.2g} P:{polarization:.2g}"
+            f"{desc} | {name} S:{surrogate_disparity:.2g} D:{disparity:.2g} P:{polarization:.2g}"
         )
         progress_bar.update(1)
         progress_bar.refresh()
@@ -913,6 +1166,32 @@ def robust_link_recommendation_baseline(
             "Number of Nodes": n,
         }
     )
+    cbar_fro = float(np.linalg.norm(Cbar, "fro"))
+    cbar_spec = float(np.linalg.norm(Cbar, 2))
+    records_outer.append(
+        {
+            "Name": name,
+            "Metric": "C deviation Frobenius",
+            "Percent Change": 0.0,
+            "Value": 0.0,
+            "k": 0,
+            "Norm Constraint": norm_constraint,
+            "Rho": rho,
+            "Number of Nodes": n,
+        }
+    )
+    records_outer.append(
+        {
+            "Name": name,
+            "Metric": "C deviation spectral",
+            "Percent Change": 0.0,
+            "Value": 0.0,
+            "k": 0,
+            "Norm Constraint": norm_constraint,
+            "Rho": rho,
+            "Number of Nodes": n,
+        }
+    )
 
     eta_time = 0.0
 
@@ -933,6 +1212,7 @@ def robust_link_recommendation_baseline(
             selection=inner_selection,
             track_fiedler=False,
             betweenness_refresh=betweenness_refresh,
+            Cbar_for_groups=Cbar,
         )
         records_inner.append(df_inner)
         eta_time += L_eta_time
@@ -942,10 +1222,7 @@ def robust_link_recommendation_baseline(
             X=X,
             Cbar=Cbar,
             rho=rho,
-            norm_constraint=norm_constraint,
-            T_C=T_C,
-            C0=C0,
-            step0=eta_C,
+            C_prev=C0,
         )
 
         worst_surrogate_disparity_new = float(top_eigenpair(X * C_new)[0])
@@ -999,6 +1276,33 @@ def robust_link_recommendation_baseline(
                 "Number of Nodes": n,
             }
         )
+        diff_C = C_new - Cbar
+        dev_fro = float(np.linalg.norm(diff_C, "fro"))
+        dev_spec = float(np.linalg.norm(diff_C, 2))
+        records_outer.append(
+            {
+                "Name": name,
+                "Metric": "C deviation Frobenius",
+                "Percent Change": float(100.0 * dev_fro / (cbar_fro + 1e-14)),
+                "Value": dev_fro,
+                "k": k + 1,
+                "Norm Constraint": norm_constraint,
+                "Rho": rho,
+                "Number of Nodes": n,
+            }
+        )
+        records_outer.append(
+            {
+                "Name": name,
+                "Metric": "C deviation spectral",
+                "Percent Change": float(100.0 * dev_spec / (cbar_spec + 1e-14)),
+                "Value": dev_spec,
+                "k": k + 1,
+                "Norm Constraint": norm_constraint,
+                "Rho": rho,
+                "Number of Nodes": n,
+            }
+        )
 
     df_outer = pd.DataFrame(records_outer)
     df_inner = pd.concat(records_inner, ignore_index=True)
@@ -1014,44 +1318,112 @@ def get_iteration_parameters(n, eps):
 
     return T_L, T_C, K, q
 
+
+_FROBENIUS_METRIC_LABEL = '$\\|L_{t} - L_{0}\\|_F$ / $\\|L_{0}\\|_F$'
+
+_EXPERIMENT_4_AUX_INNER_METRICS = frozenset(
+    {
+        "Mean M cross-group",
+        "Mean M within-group",
+        "Intervention churn (cum. abs Δw)",
+        "Edges removed (cumulative)",
+        "Intra-group abs weight Δ (cum.)",
+        "Inter-group abs weight Δ (cum.)",
+    }
+)
+
+_EXPERIMENT_4_AUX_INNER_METRICS_ORDER = (
+    "Mean M cross-group",
+    "Mean M within-group",
+    "Intervention churn (cum. abs Δw)",
+    "Edges removed (cumulative)",
+    "Intra-group abs weight Δ (cum.)",
+    "Inter-group abs weight Δ (cum.)",
+)
+
+_EXPERIMENT_4_OUTER_C_DEV_METRICS = frozenset(
+    {
+        "C deviation Frobenius",
+        "C deviation spectral",
+    }
+)
+
+
+def _experiment_4_forward_fill_meta(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in ['Name', 'Rho', 'Norm Constraint', 'Number of Nodes', 'Time (s)', 'Per Step Time (s)']:
+        if col in out.columns:
+            out[col] = out[col].ffill()
+    return out
+
+
+def _experiment_4_inner_last_run_for_metrics(df: pd.DataFrame, inner_metrics: frozenset) -> pd.DataFrame:
+    """Keep only the final outer-iteration inner trajectory per (Name, Rho) for the given metrics."""
+    d = df[df["Metric"].isin(inner_metrics)].copy()
+    if d.empty:
+        return d
+    d = d.sort_index()
+    pieces = []
+    for (_, _), g in d.groupby(["Name", "Rho"], sort=False):
+        step = g["Step"].to_numpy()
+        if len(step) == 0:
+            continue
+        run_id = np.cumsum(np.r_[0, (np.diff(step) < 0).astype(int)])
+        last_run = int(run_id.max())
+        g2 = g.assign(_run_id=run_id)
+        pieces.append(g2[g2["_run_id"] == last_run].drop(columns=["_run_id"]))
+    return pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame()
+
+
+def _experiment_4_inner_last_run(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only the final outer-iteration inner trajectory per (Name, Rho)."""
+    return _experiment_4_inner_last_run_for_metrics(
+        df,
+        frozenset({"Surrogate", "Disparity", "Polarization", _FROBENIUS_METRIC_LABEL}),
+    )
+
+
 def experiment_1_link_recommendation_oracle(args: argparse.Namespace):
     out_dir = args.out_dir
 
     datasets = get_datasets(args)
 
-    concat_df = []
 
-    for name, group_types in datasets:
-        for group_type in group_types:
-            G, s, Cbar = load_dataset(name, group_type)
-            T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
-            T_C = 1
-            K = 1
-            df, L, X, M, H, eta_time = link_recommendation(G, s, Cbar, name, T_L=T_L, batch_size=args.batch_size, eta=args.eta, seed=args.seed)
+    if args.cached_results:
+        concat_df = pd.read_csv(f'{out_dir}/experiment_1_link_recommendation_oracle.csv')
+    else:
+        concat_df = []
+        for name, group_types in datasets:
+            for group_type in group_types:
+                G, s, Cbar = load_dataset(name, group_type)
+                T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
+                T_C = 1
+                K = 1
+                df, L, X, M, H, eta_time = link_recommendation(G, s=None if args.s_type == 'actual' else s, C=Cbar, name=name, T_L=T_L, batch_size=args.batch_size, eta=args.eta, seed=args.seed)
 
-            df['Name'] = name
-            df['Nominal Partition Type'] = group_type
-            df['Number of Link Recommendations'] = T_L
-            df['Number of Worst Case Solves'] = T_C
-            df['Number of Outer Iterations'] = K
-            df['Number of Sketch Vectors'] = q
-            df['Number of Nodes'] = G.number_of_nodes()
-            df['Batch Size'] = args.batch_size
-            df['Learning Rate'] = args.eta
-            df['Seed'] = args.seed
-            df['Time (s)'] = eta_time
-            df['Per Step Time (s)'] = eta_time / T_L
-            concat_df.append(df)
+                df['Name'] = name
+                df['Nominal Partition Type'] = group_type
+                df['Number of Link Recommendations'] = T_L
+                df['Number of Worst Case Solves'] = T_C
+                df['Number of Outer Iterations'] = K
+                df['Number of Sketch Vectors'] = q
+                df['Number of Nodes'] = G.number_of_nodes()
+                df['Batch Size'] = args.batch_size
+                df['Learning Rate'] = args.eta
+                df['Seed'] = args.seed
+                df['Time (s)'] = eta_time
+                df['Per Step Time (s)'] = eta_time / T_L
+                concat_df.append(df)
 
-    concat_df = pd.concat(concat_df, ignore_index=True)
-    concat_df = concat_df[np.isfinite(concat_df['Percent Change'])].copy()
+        concat_df = pd.concat(concat_df, ignore_index=True)
+        concat_df = concat_df[np.isfinite(concat_df['Percent Change'])].copy()
 
     num_names = concat_df['Name'].nunique()
     num_nominal_partition_types = concat_df['Nominal Partition Type'].nunique()
 
     fig_a, ax_a = plt.subplots(nrows=1, ncols=(1 + num_names), figsize=(FIGSIZE * (1 + num_names), FIGSIZE), squeeze=False)
-    fig_b, ax_b = plt.subplots(nrows=num_nominal_partition_types - 1, ncols=num_names, figsize=(FIGSIZE * num_names, FIGSIZE * (num_nominal_partition_types - 1)), squeeze=False, sharey=True)
-    fig_c, ax_c = plt.subplots(nrows=1, ncols=num_names, figsize=(FIGSIZE * num_names, FIGSIZE), squeeze=False, sharey=True)
+    fig_b, ax_b = plt.subplots(nrows=num_nominal_partition_types - 1, ncols=num_names, figsize=(FIGSIZE * num_names, FIGSIZE * (num_nominal_partition_types - 1)), squeeze=False)
+    fig_c, ax_c = plt.subplots(nrows=1, ncols=num_names, figsize=(FIGSIZE * num_names, FIGSIZE), squeeze=False)
 
     alpha = 0.1
     min_percent_change = (1 + alpha) * concat_df['Percent Change'].min()
@@ -1060,7 +1432,7 @@ def experiment_1_link_recommendation_oracle(args: argparse.Namespace):
     for i, name in enumerate(concat_df['Name'].unique()):
         df_name = concat_df[concat_df['Name'] == name].copy()
         df_a = df_name[df_name['Step'] == df_name['Step'].max()].reset_index(drop=True)
-        sns.barplot(x='Nominal Partition Type', y='Percent Change', hue='Metric', data=df_a, ax=ax_a[0, i], dodge=True, palette="deep", legend=(i == num_names - 1))
+        sns.barplot(x='Nominal Partition Type', y='Percent Change', hue='Metric', data=df_a, ax=ax_a[0, i], dodge=True, legend=(i == num_names - 1))
         ax_a[0, i].set_title(name)
         ax_a[0, i].set_ylim(min_percent_change, max_percent_change)
 
@@ -1093,8 +1465,8 @@ def experiment_1_link_recommendation_oracle(args: argparse.Namespace):
     max_number_of_nodes = int((1 + alpha) * concat_df['Number of Nodes'].max())
 
     n_range = np.arange(min_number_of_nodes, max_number_of_nodes, 50)
-    nominal_runtime = n_range * np.log(n_range) / args.eps**4
-    ax_a[0, -1].plot(n_range, nominal_runtime, label='Upper bound $O(n \\log n / \\epsilon^4)$', color='red', linestyle='--')
+    # nominal_runtime = n_range * np.log(n_range) / args.eps**4
+    # ax_a[0, -1].plot(n_range, nominal_runtime, label='Upper bound $O(n \\log n / \\epsilon^4)$', color='red', linestyle='--')
     ax_a[0, -1].legend(loc='upper right')
     ax_a[0, -1].set_title('Runtime of Link Recommendation Oracle')
     ax_a[0, -1].set_xlabel('Number of Nodes')
@@ -1103,15 +1475,15 @@ def experiment_1_link_recommendation_oracle(args: argparse.Namespace):
 
     ax_a[0, -1].set_yscale('log')
 
-    fig_a.suptitle('Link Recommendation Oracle')
+    fig_a.suptitle('Link Recommendation Oracle (Step 1)')
     fig_a.tight_layout()
     fig_a.savefig(f'{out_dir}/experiment_1a_link_recommendation_oracle.pdf', dpi=300, bbox_inches='tight')
 
-    fig_b.suptitle('Link Recommendation Oracle')
+    fig_b.suptitle('Link Recommendation Oracle (Step 1)')
     fig_b.tight_layout()
     fig_b.savefig(f'{out_dir}/experiment_1b_link_recommendation_oracle.pdf', dpi=300, bbox_inches='tight')
 
-    fig_c.suptitle('Per Step Time of Link Recommendation Oracle')
+    fig_c.suptitle('Per Step Time of Link Recommendation Oracle (Step 1)')
     fig_c.tight_layout()
     fig_c.savefig(f'{out_dir}/experiment_1c_link_recommendation_oracle.pdf', dpi=300, bbox_inches='tight')
 
@@ -1121,67 +1493,48 @@ def experiment_2_link_recommendation_oracle(args: argparse.Namespace):
     out_dir = args.out_dir
 
     datasets = get_datasets(args)
-    
-    concat_df = []
 
-    p_values = np.array([0.1, 0.2, 0.3, 0.4, 0.5])
-    eps_values = np.array([0.1, 0.5, 1, 5, 10])
+    if args.cached_results:
+        concat_df = pd.read_csv(f'{out_dir}/experiment_2_link_recommendation_oracle.csv')
+    else:
+        concat_df = []
 
-    for name, group_types in datasets:
-        for group_type in group_types:
-            print(f"Running {name} with {group_type}")
-            G, s, Cbar = load_dataset(name, group_type)
-            T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
+        p_values = np.array([0.1, 0.2, 0.3, 0.4, 0.5])
 
-            for p in p_values:
-                C = generate_correlation_matrix_scenario(Cbar, mode='classifier_error', p=p)
-                df, L, X, M, H, eta_time = link_recommendation(G, s, C, name, T_L=T_L, batch_size=args.batch_size, eta=1.0, seed=args.seed)
+        for name, group_types in datasets:
+            for group_type in set(group_types) - {'polarization'}:
+                print(f"Running {name} with {group_type}")
+                G, s, Cbar = load_dataset(name, group_type)
+                T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
 
-                df['Name'] = name
-                df['Nominal Partition Type'] = group_type
-                df['Number of Link Recommendations'] = T_L
-                df['Number of Worst Case Solves'] = T_C
-                df['Number of Outer Iterations'] = K
-                df['Number of Sketch Vectors'] = q
-                df['Number of Nodes'] = G.number_of_nodes()
-                df['Batch Size'] = args.batch_size
-                df['Learning Rate'] = args.eta
-                df['Seed'] = args.seed
-                df['Time (s)'] = eta_time
-                df['Per Step Time (s)'] = eta_time / T_L
-                df['Parameter Value'] = p
-                df['Scenario Type'] = 'Classifier Error ($p$)'
-            
-                concat_df.append(df)
+                for p in p_values:
+                    C = generate_correlation_matrix_scenario(Cbar, mode='classifier_error', p=p)
+                    df, L, X, M, H, eta_time = link_recommendation(G, s=s if args.s_type == 'actual' else None, C=C, name=name, T_L=T_L, batch_size=args.batch_size, eta=1.0, seed=args.seed)
 
-            for eps in eps_values:
-                C = generate_correlation_matrix_scenario(Cbar, mode='differential_privacy', epsilon=eps)
-                df, L, X, M, H, eta_time = link_recommendation(G, s, C, name, T_L=T_L, batch_size=args.batch_size, eta=1.0, seed=args.seed)
+                    df['Name'] = name
+                    df['Nominal Partition Type'] = group_type
+                    df['Number of Link Recommendations'] = T_L
+                    df['Number of Worst Case Solves'] = T_C
+                    df['Number of Outer Iterations'] = K
+                    df['Number of Sketch Vectors'] = q
+                    df['Number of Nodes'] = G.number_of_nodes()
+                    df['Batch Size'] = args.batch_size
+                    df['Learning Rate'] = args.eta
+                    df['Seed'] = args.seed
+                    df['Time (s)'] = eta_time
+                    df['Per Step Time (s)'] = eta_time / T_L
+                    df['Parameter Value'] = p
+                    df['Scenario Type'] = 'Classifier Error ($p$)'
 
-                df['Name'] = name
-                df['Nominal Partition Type'] = group_type
-                df['Number of Link Recommendations'] = T_L
-                df['Number of Worst Case Solves'] = T_C
-                df['Number of Outer Iterations'] = K
-                df['Number of Sketch Vectors'] = q
-                df['Number of Nodes'] = G.number_of_nodes()
-                df['Batch Size'] = args.batch_size
-                df['Learning Rate'] = args.eta
-                df['Seed'] = args.seed
-                df['Time (s)'] = eta_time
-                df['Per Step Time (s)'] = eta_time / T_L
-                df['Parameter Value'] = eps
-                df['Scenario Type'] = 'Privacy Budget ($\\epsilon$)'
+                    concat_df.append(df)
 
-                concat_df.append(df)
-
-    concat_df = pd.concat(concat_df, ignore_index=True)
-    concat_df = concat_df[np.isfinite(concat_df['Percent Change'])].copy()
+        concat_df = pd.concat(concat_df, ignore_index=True)
+        concat_df = concat_df[np.isfinite(concat_df['Percent Change'])].copy()
 
     num_names = concat_df['Name'].nunique()
     num_parameter_types = concat_df['Scenario Type'].nunique()
 
-    fig_a, ax_a = plt.subplots(nrows=num_parameter_types, ncols=num_names, figsize=(FIGSIZE * num_names, FIGSIZE * num_parameter_types), squeeze=False, sharey=True)
+    fig_a, ax_a = plt.subplots(nrows=num_parameter_types, ncols=num_names, figsize=(FIGSIZE * num_names, FIGSIZE * num_parameter_types), squeeze=False)
 
     for i, name in enumerate(concat_df['Name'].unique()):
         for j, scenario_type in enumerate(concat_df['Scenario Type'].unique()):
@@ -1212,8 +1565,7 @@ def experiment_2_link_recommendation_oracle(args: argparse.Namespace):
 
             ax_a[j, i].set_xlabel(scenario_type)   
 
-            if scenario_type == 'Privacy Budget ($\\epsilon$)':
-                ax_a[j, i].set_xscale('log')
+            ax_a[j, i].set_ylim(0, 120)
 
     fig_a.suptitle('Impact of Platform Intervention as a Function of Uncertainty')
     fig_a.tight_layout()
@@ -1221,35 +1573,36 @@ def experiment_2_link_recommendation_oracle(args: argparse.Namespace):
 
     concat_df.to_csv(f'{out_dir}/experiment_2_link_recommendation_oracle.csv', index=False)
 
-def experiment_3_worst_case_C_oracle(args: argparse.Namespace, s_type='actual'):
+def experiment_3_worst_case_C_oracle(args: argparse.Namespace):
     out_dir = args.out_dir
 
-    datasets = get_datasets(args)
+    csv_path = f'{out_dir}/experiment_3_{args.s_type}_worst_case_C_oracle.csv'
 
-    concat_df = []
+    if args.cached_results:
+        concat_df = pd.read_csv(csv_path)
+    else:
+        datasets = get_datasets(args)
 
-    rho_values = np.array([0.1, 0.2, 0.4, 0.4, 0.5])
-    norm_constraints = ['spectral_ball']
+        rho_values = np.array([0.1, 0.2, 0.3, 0.4, 0.5])
 
-    rng = np.random.default_rng(0)
+        rng = np.random.default_rng(0)
 
-    records = []
+        records = []
 
-    for name, group_types in datasets:
-        for group_type in group_types:
-            print(f"Running {name} with {group_type}")
-            G, s, Cbar = load_dataset(name, group_type)
-            T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
-            L = sparse_laplacian(G)
-            U, X = sketch_solve_X(L, q, rng)
-            M = X @ X
+        for name, group_types in datasets:
+            for group_type in set(group_types) - {'polarization'}:
+                print(f"Running {name} with {group_type}")
+                G, s, Cbar = load_dataset(name, group_type)
+                T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
+                L = sparse_laplacian(G)
+                U, X = sketch_solve_X(L, q, rng)
+                M = X @ X
 
-            for norm_constraint in norm_constraints:
                 for rho in rho_values:
-                    print(f'rho = {rho}')
+                    print(f'Classifier error rho = {rho}')
 
-                    if s_type == 'actual':
-                        C_wc, eta_time = worst_case_C_for_fixed_L(L, X, Cbar, rho, s=s, step0=2*rho, tol=1e-10, T_C=T_C, norm_constraint=norm_constraint)
+                    if args.s_type == 'actual':
+                        C_wc, eta_time = worst_case_C_for_fixed_L(L, X, Cbar, rho, s=s, C_prev=None)
 
                         worst_case_C_disparity = s.T @ (M * C_wc) @ s
                         worst_case_C_surrogate = s.T @ (X * C_wc) @ s
@@ -1257,8 +1610,8 @@ def experiment_3_worst_case_C_oracle(args: argparse.Namespace, s_type='actual'):
                         worst_case_Cbar_disparity = s.T @ (M * Cbar) @ s
                         worst_case_Cbar_surrogate = s.T @ (X * Cbar) @ s
 
-                    elif s_type == 'adversarial':
-                        C_wc, eta_time = worst_case_C_for_fixed_L(L, X, Cbar, rho, s=None, step0=2*rho, tol=1e-10, T_C=T_C, norm_constraint=norm_constraint)
+                    elif args.s_type == 'adversarial':
+                        C_wc, eta_time = worst_case_C_for_fixed_L(L, X, Cbar, rho, s=None, C_prev=None)
 
                         worst_case_C_disparity, _ = top_eigenpair(M * C_wc)
                         worst_case_C_surrogate, _ = top_eigenpair(X * C_wc)
@@ -1274,18 +1627,16 @@ def experiment_3_worst_case_C_oracle(args: argparse.Namespace, s_type='actual'):
                     records.append({
                         'Name': name,
                         'Nominal Partition Type': group_type,
-                        'Norm Constraint': norm_constraint,
                         'Rho': rho,
-                        'Metric': 'Disparity Percent Change',
+                        'Metric': 'Disparity',
                         'Value': disparity_change,
                         'Number of Nodes': n,
                     })
                     records.append({
                         'Name': name,
                         'Nominal Partition Type': group_type,
-                        'Norm Constraint': norm_constraint,
                         'Rho': rho,
-                        'Metric': 'Surrogate Percent Change',
+                        'Metric': 'Surrogate',
                         'Value': surrogate_change,
                         'Number of Nodes': n,
                     })
@@ -1293,7 +1644,6 @@ def experiment_3_worst_case_C_oracle(args: argparse.Namespace, s_type='actual'):
                     records.append({
                         'Name': name,
                         'Nominal Partition Type': group_type,
-                        'Norm Constraint': norm_constraint,
                         'Rho': rho,
                         'Metric': 'Time (s)',
                         'Value': eta_time,
@@ -1302,36 +1652,36 @@ def experiment_3_worst_case_C_oracle(args: argparse.Namespace, s_type='actual'):
                     records.append({
                         'Name': name,
                         'Nominal Partition Type': group_type,
-                        'Norm Constraint': norm_constraint,
                         'Rho': rho,
                         'Metric': 'Per Step Time (s)',
                         'Value': eta_time / T_C,
                         'Number of Nodes': n,
                     })
 
-    concat_df = pd.DataFrame(records)
+        concat_df = pd.DataFrame(records)
 
     num_names = concat_df['Name'].nunique()
 
-    fig_a, ax_a = plt.subplots(nrows=1, ncols=(1 + num_names), figsize=(FIGSIZE * (1 + num_names), FIGSIZE), squeeze=False, sharey=True)
+    fig_a, ax_a = plt.subplots(nrows=1, ncols=(1 + num_names), figsize=(FIGSIZE * (1 + num_names), FIGSIZE), squeeze=False)
 
     for i, name in enumerate(concat_df['Name'].unique()):
-        df_name = concat_df[(concat_df['Name'] == name) & (concat_df['Metric'].isin(['Disparity Percent Change', 'Surrogate Percent Change']))].copy()
+        df_name = concat_df[(concat_df['Name'] == name) & (concat_df['Metric'].isin(['Disparity', 'Surrogate']))].copy()
         sns.lineplot(x='Rho', y='Value', hue='Metric', style='Nominal Partition Type', markers=True, marker='x', markersize=5, data=df_name, ax=ax_a[0, i], legend=(i == num_names - 1))
         ax_a[0, i].set_title(name)
         ax_a[0, i].set_xlabel('$\\rho$')
         ax_a[0, i].set_ylabel('Percent Change')
+        ax_a[0, i].set_ylim(0, 120)
 
     df_time = concat_df[concat_df['Metric'].isin(['Time (s)'])].copy()
-    sns.lineplot(x='Number of Nodes', y='Value', hue='Rho', markers=True, marker='x', markersize=5, data=df_time, ax=ax_a[0, -1], legend=False)
+    sns.scatterplot(x='Number of Nodes', y='Value', hue='Rho', data=df_time, ax=ax_a[0, -1], legend=False)
     ax_a[0, -1].set_title('Time')
     ax_a[0, -1].set_xlabel('Number of Nodes')
     ax_a[0, -1].set_ylabel('Time (s)')
 
-    fig_a.suptitle(f'Worst Case C Oracle (s = {s_type})')
+    fig_a.suptitle(f'Correlation matrix update oracle (Step 2)')
     fig_a.tight_layout()
-    fig_a.savefig(f'{out_dir}/experiment_3_{s_type}_worst_case_C_oracle.pdf', dpi=300, bbox_inches='tight')
-    concat_df.to_csv(f'{out_dir}/experiment_3_{s_type}_worst_case_C_oracle.csv', index=False)
+    fig_a.savefig(f'{out_dir}/experiment_3_{args.s_type}_worst_case_C_oracle.pdf', dpi=300, bbox_inches='tight')
+    concat_df.to_csv(csv_path, index=False)
 
 
 def experiment_4_robust_link_recommendation_oracle(args: argparse.Namespace):
@@ -1340,32 +1690,230 @@ def experiment_4_robust_link_recommendation_oracle(args: argparse.Namespace):
     datasets = get_datasets(args)
 
     rho_values = np.array([0.1, 0.2, 0.3, 0.4, 0.5])
-    norm_constraints = ['spectral_ball']
 
-    concat_df = []
+    if args.cached_results:
+        concat_df = pd.read_csv(f'{out_dir}/experiment_4_robust_link_recommendation_oracle.csv')
+        df_opinions = pd.read_csv(f'{out_dir}/experiment_4_final_opinion_change.csv')
+    else:
+        concat_df = []
+        df_opinions = []
 
-    for name, group_types in datasets:
-        for group_type in group_types:
-            print(f"Running {name} with {group_type}")
-            G, s, Cbar = load_dataset(name, group_type)   
-            T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
+        for name, group_types in datasets:
+            for group_type in group_types:
+                print(f"Running {name} with {group_type}")
+                G, s, Cbar = load_dataset(name, group_type)
+                T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
 
+                K = 3
 
-            for rho in rho_values:
-                for norm_constraint in norm_constraints:
-                    print(f'rho = {rho}, norm_constraint = {norm_constraint}')
+                for rho in rho_values:
+                    print(f'Classifier error rho = {rho}')
 
-                    df_inner, df_outer, eta_time = robust_link_recommendation(G=G, Cbar=Cbar, rho=rho, name=name, q=q, norm_constraint=norm_constraint, T_L=T_L, T_C=T_C, K=K, batch_size=args.batch_size, eta_L=1.0, eta_C=2*rho, seed=args.seed)
+                    df_inner, df_outer, eta_time, M0, M = robust_link_recommendation(G=G, Cbar=Cbar, rho=rho, name=name, q=q, T_L=T_L, T_C=T_C, K=K, batch_size=args.batch_size, eta_L=1.0, eta_C=2*rho, seed=args.seed)
+                    
                     df_inner['Time (s)'] = eta_time
                     df_outer['Time (s)'] = eta_time
                     df_inner['Per Step Time (s)'] = eta_time / (K * T_C * T_L)
                     df_outer['Per Step Time (s)'] = eta_time / (K * T_C * T_L)
-
                     concat_df.append(df_inner)
                     concat_df.append(df_outer)
 
-    concat_df = pd.concat(concat_df, ignore_index=True)
+                    z_init = M0 @ s
+                    z_final = M @ s
+                    z_change = z_final - z_init
+                    z_change = z_change / np.linalg.norm(z_change)
+                    for i in range(z_change.shape[0]):
+                        df_opinions.append({
+                            'Name': name,
+                            'Rho': rho,
+                            'Value': z_change[i],
+                            'User ID': i,
+                        })
+
+        concat_df = pd.concat(concat_df, ignore_index=True)
+        concat_df = concat_df[np.isfinite(concat_df['Percent Change'])].copy()
+        df_opinions = pd.DataFrame(df_opinions)
+
+    plot_df = _experiment_4_forward_fill_meta(concat_df)
+    df_inner_last = _experiment_4_inner_last_run(plot_df)
+    if df_inner_last.empty:
+        concat_df.to_csv(f'{out_dir}/experiment_4_robust_link_recommendation_oracle.csv', index=False)
+        return
+
+    num_names = plot_df['Name'].nunique()
+    rho_values_sorted = sorted(plot_df['Rho'].dropna().unique())
+    num_rhos = len(rho_values_sorted)
+
+    fig_a, ax_a = plt.subplots(nrows=1, ncols=(1 + num_names), figsize=(FIGSIZE * (1 + num_names), FIGSIZE), squeeze=False)
+    fig_b, ax_b = plt.subplots(
+        nrows=num_rhos,
+        ncols=num_names,
+        figsize=(FIGSIZE * num_names, FIGSIZE * num_rhos),
+        squeeze=False,
+        sharey=True,
+    )
+    fig_c, ax_c = plt.subplots(nrows=1, ncols=num_names, figsize=(FIGSIZE * num_names, FIGSIZE), squeeze=False, sharey=True)
+
+    alpha = 0.1
+    min_percent_change = (1 + alpha) * df_inner_last['Percent Change'].min()
+    max_percent_change = (1 + alpha) * df_inner_last['Percent Change'].max()
+
+    idx_max = df_inner_last.groupby(['Name', 'Rho'])['Step'].transform('max')
+    df_bar = df_inner_last[df_inner_last['Step'] == idx_max].copy()
+
+    for i, name in enumerate(plot_df['Name'].unique()):
+        df_name = plot_df[plot_df['Name'] == name].copy()
+        sns.barplot(x='Rho', y='Percent Change', hue='Metric', data=df_bar[(df_bar['Name'] == name) & (df_bar['Metric'].isin(['Surrogate', 'Disparity']))], ax=ax_a[0, i], dodge=True, legend=(i == num_names - 1))
+        ax_a[0, i].set_title(name)
+        ax_a[0, i].set_ylim(min_percent_change, max_percent_change)
+
+        df_time = df_name.drop_duplicates(subset=['Rho'], keep='first')
+        sns.barplot(x='Rho', y='Per Step Time (s)', data=df_time, ax=ax_c[0, i], dodge=True, legend=(i == num_names - 1))
+        ax_c[0, i].set_title(name)
+
+        for j, rho in enumerate(rho_values_sorted):
+            df_b = df_inner_last[(df_inner_last['Name'] == name) & (df_inner_last['Rho'] == rho) & (df_inner_last['Metric'].isin(['Surrogate', 'Disparity']))].copy()
+            sns.lineplot(
+                x='Step',
+                y='Percent Change',
+                hue='Metric',
+                data=df_b,
+                ax=ax_b[j, i],
+                legend=(i == num_names - 1) and (j == num_rhos - 1),
+            )
+            ax_b[j, i].set_ylim(min_percent_change, max_percent_change)
+            if i == 0:
+                ax_b[j, i].set_ylabel(f'$\\rho = {rho}$')
+            if j == num_rhos - 1:
+                ax_b[j, i].set_xlabel('Step')
+            if j == 0:
+                ax_b[j, i].set_title(name)
+
+    plot_df_sorted = plot_df.sort_values(by='Number of Nodes')
+    df_rt = plot_df_sorted.drop_duplicates(subset=['Name', 'Rho'], keep='first')
+    sns.scatterplot(x='Number of Nodes', y='Time (s)', hue='Rho', style='Name', data=df_rt, ax=ax_a[0, -1], legend=True)
+    ax_a[0, -1].set_title('Runtime of Robust Link Recommendation Oracle')
+    ax_a[0, -1].set_xlabel('Number of Nodes')
+    ax_a[0, -1].set_ylabel('Runtime (s)')
+
+    alpha_n = 0.05
+    min_number_of_nodes = int((1 - alpha_n) * plot_df_sorted['Number of Nodes'].min())
+    max_number_of_nodes = int((1 + alpha_n) * plot_df_sorted['Number of Nodes'].max())
+    ax_a[0, -1].set_xlim(min_number_of_nodes, max_number_of_nodes)
+    ax_a[0, -1].set_yscale('log')
+
+    fig_a.suptitle('Robust Link Recommendation Oracle')
+    fig_a.tight_layout()
+    fig_a.savefig(f'{out_dir}/experiment_4a_robust_link_recommendation_oracle.pdf', dpi=300, bbox_inches='tight')
+
+    fig_b.suptitle('Robust Link Recommendation Oracle')
+    fig_b.tight_layout()
+    fig_b.savefig(f'{out_dir}/experiment_4b_robust_link_recommendation_oracle.pdf', dpi=300, bbox_inches='tight')
+
+    fig_c.suptitle('Per Step Time of Robust Link Recommendation Oracle')
+    fig_c.tight_layout()
+    fig_c.savefig(f'{out_dir}/experiment_4c_robust_link_recommendation_oracle.pdf', dpi=300, bbox_inches='tight')
+
+    # --- Auxiliary inner metrics: last inner step of final outer iteration (bar by rho) ---
+    df_aux_last = _experiment_4_inner_last_run_for_metrics(plot_df, _EXPERIMENT_4_AUX_INNER_METRICS)
+    if not df_aux_last.empty:
+        idx_max_aux = df_aux_last.groupby(["Name", "Rho"])["Step"].transform("max")
+        df_aux_bar = df_aux_last[df_aux_last["Step"] == idx_max_aux].copy()
+        name_list = list(plot_df["Name"].unique())
+        fig_d, ax_d = plt.subplots(
+            nrows=1,
+            ncols=num_names,
+            figsize=(FIGSIZE * num_names, FIGSIZE),
+            squeeze=False,
+        )
+        for i, name in enumerate(name_list):
+            sub = df_aux_bar[df_aux_bar["Name"] == name].copy()
+            sns.barplot(
+                x="Rho",
+                y="Percent Change",
+                hue="Metric",
+                hue_order=list(_EXPERIMENT_4_AUX_INNER_METRICS_ORDER),
+                data=sub,
+                ax=ax_d[0, i],
+                dodge=True,
+                legend=(i == num_names - 1),
+            )
+            ax_d[0, i].set_title(name)
+            ax_d[0, i].set_xlabel(r"$\rho$")
+            if i == 0:
+                ax_d[0, i].set_ylabel("Percent change")
+        
+        fig_d.tight_layout()
+        fig_d.savefig(
+            f"{out_dir}/experiment_4d_robust_link_recommendation_oracle.pdf",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close(fig_d)
+
+    # --- Outer-loop $C$ deviation from $\bar C$: final outer iteration (bar by rho) ---
+    df_c_dev = plot_df[plot_df["Metric"].isin(_EXPERIMENT_4_OUTER_C_DEV_METRICS)].dropna(subset=["k"])
+    if not df_c_dev.empty:
+        idx_max_k = df_c_dev.groupby(["Name", "Rho", "Metric"])["k"].transform("max")
+        df_c_bar = df_c_dev[df_c_dev["k"] == idx_max_k].copy()
+        metric_order = ["C deviation Frobenius", "C deviation spectral"]
+        name_list = list(plot_df["Name"].unique())
+        fig_e, ax_e = plt.subplots(
+            nrows=1,
+            ncols=num_names,
+            figsize=(FIGSIZE * num_names, FIGSIZE),
+            squeeze=False,
+        )
+        for i, name in enumerate(name_list):
+            sub = df_c_bar[df_c_bar["Name"] == name].copy()
+            sns.barplot(
+                x="Rho",
+                y="Value",
+                hue="Metric",
+                hue_order=metric_order,
+                data=sub,
+                ax=ax_e[0, i],
+                dodge=True,
+                legend=(i == num_names - 1),
+            )
+            ax_e[0, i].set_title(name)
+            ax_e[0, i].set_xlabel(r"$\rho$")
+            if i == 0:
+                ax_e[0, i].set_ylabel(r"$\|C_k - \bar C\|$")
+        
+        fig_e.tight_layout()
+        fig_e.savefig(
+            f"{out_dir}/experiment_4e_robust_link_recommendation_oracle.pdf",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close(fig_e)
+
+    # lineplot of final opinion change by node id for each name hue by rho
+    fig_f, ax_f = plt.subplots(nrows=1, ncols=(1 + num_names), figsize=(FIGSIZE * (1 + num_names), FIGSIZE), squeeze=False)
+    for i, name in enumerate(name_list):
+        df_name = df_opinions[df_opinions["Name"] == name].copy()
+        sns.lineplot(x="User ID", y="Value", hue="Rho", data=df_name, ax=ax_f[0, i], markers=True, marker='o', markersize=5)
+        ax_f[0, i].set_title(name)
+        ax_f[0, i].set_xlabel("User ID")
+        if i == 0:
+            ax_f[0, i].set_ylabel("Normalized Opinion Change")
+        else:
+            ax_f[0, i].set_ylabel('')
+        ax_f[0, i].set_ylim(-1, 1)
+
+    sns.barplot(x="Rho", y="Value", hue="Name", dodge=True, data=df_opinions, ax=ax_f[0, -1], palette='viridis')
+    ax_f[0, -1].set_xlabel("$\\rho$")
+    ax_f[0, -1].set_ylabel("")
+    ax_f[0, -1].set_title('average')
+
+    fig_f.tight_layout()
+    fig_f.savefig(f'{out_dir}/experiment_4f_robust_link_recommendation_oracle.pdf', dpi=300, bbox_inches='tight')
+
+
+    df_opinions.to_csv(f'{out_dir}/experiment_4_final_opinion_change.csv', index=False)
     concat_df.to_csv(f'{out_dir}/experiment_4_robust_link_recommendation_oracle.csv', index=False)
+
 
 
 def experiment_5_fiedler_gradient_ascent(args: argparse.Namespace):
@@ -1377,39 +1925,42 @@ def experiment_5_fiedler_gradient_ascent(args: argparse.Namespace):
 
     datasets = get_datasets(args)
 
-    concat_df = []
+    if args.cached_results:
+        concat_df = pd.read_csv(f"{out_dir}/experiment_5_fiedler_gradient_ascent.csv")
+    else:
+        concat_df = []
 
-    for name, group_types in datasets:
-        for group_type in group_types:
-            G, s, Cbar = load_dataset(name, group_type)
-            T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
-            T_C = 1
-            K = 1
-            df, L, X, M, H, eta_time = fiedler_maximizing_link_recommendation(
-                G,
-                s,
-                Cbar,
-                name,
-                T_L=T_L,
-                batch_size=args.batch_size,
-                eta=args.eta,
-                seed=args.seed,
-            )
+        for name, group_types in datasets:
+            for group_type in set(group_types) - {'polarization'}:
+                G, s, Cbar = load_dataset(name, group_type)
+                T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
+                T_C = 1
+                K = 1
+                df, L, X, M, H, eta_time = fiedler_maximizing_link_recommendation(
+                    G,
+                    s,
+                    Cbar,
+                    name,
+                    T_L=T_L,
+                    batch_size=args.batch_size,
+                    eta=args.eta,
+                    seed=args.seed,
+                )
 
-            df["Name"] = name
-            df["Nominal Partition Type"] = group_type
-            df["Number of Link Recommendations"] = T_L
-            df["Number of Sketch Vectors"] = q
-            df["Number of Nodes"] = G.number_of_nodes()
-            df["Batch Size"] = args.batch_size
-            df["Learning Rate"] = args.eta
-            df["Seed"] = args.seed
-            df["Time (s)"] = eta_time
-            df["Per Step Time (s)"] = eta_time / T_L
-            concat_df.append(df)
+                df["Name"] = name
+                df["Nominal Partition Type"] = group_type
+                df["Number of Link Recommendations"] = T_L
+                df["Number of Sketch Vectors"] = q
+                df["Number of Nodes"] = G.number_of_nodes()
+                df["Batch Size"] = args.batch_size
+                df["Learning Rate"] = args.eta
+                df["Seed"] = args.seed
+                df["Time (s)"] = eta_time
+                df["Per Step Time (s)"] = eta_time / T_L
+                concat_df.append(df)
 
-    concat_df = pd.concat(concat_df, ignore_index=True)
-    concat_df = concat_df[np.isfinite(concat_df["Percent Change"])].copy()
+        concat_df = pd.concat(concat_df, ignore_index=True)
+        concat_df = concat_df[np.isfinite(concat_df["Percent Change"])].copy()
 
     num_names = concat_df["Name"].nunique()
     partition_types_for_lines = sorted(
@@ -1453,7 +2004,6 @@ def experiment_5_fiedler_gradient_ascent(args: argparse.Namespace):
             data=df_a,
             ax=ax_a[0, i],
             dodge=True,
-            palette="deep",
             legend=(i == num_names - 1),
         )
         ax_a[0, i].set_title(name)
@@ -1512,15 +2062,15 @@ def experiment_5_fiedler_gradient_ascent(args: argparse.Namespace):
 
     ax_a[0, -1].set_yscale("log")
 
-    fig_a.suptitle("Fiedler value maximization (gradient ascent on $L$)")
+    fig_a.suptitle("Robust Link Recommendation (Unconstrained U)")
     fig_a.tight_layout()
     fig_a.savefig(f"{out_dir}/experiment_5a_fiedler_gradient_ascent.pdf", dpi=300, bbox_inches="tight")
 
-    fig_b.suptitle("Fiedler value maximization (gradient ascent on $L$)")
+    fig_b.suptitle("Robust Link Recommendation (Unconstrained U)")
     fig_b.tight_layout()
     fig_b.savefig(f"{out_dir}/experiment_5b_fiedler_gradient_ascent.pdf", dpi=300, bbox_inches="tight")
 
-    fig_c.suptitle("Per step time — Fiedler gradient ascent")
+    fig_c.suptitle("Per step time — Robust Link Recommendation (Unconstrained U)")
     fig_c.tight_layout()
     fig_c.savefig(f"{out_dir}/experiment_5c_fiedler_gradient_ascent.pdf", dpi=300, bbox_inches="tight")
 
@@ -1532,42 +2082,46 @@ def experiment_6_link_recommendation_baselines(args: argparse.Namespace) -> None
     out_dir = args.out_dir
     datasets = get_datasets(args)
     selections = ["leverage", "random", "max_degree", "max_betweenness"]
-    concat_df: List[pd.DataFrame] = []
 
-    for name, group_types in datasets:
-        for group_type in group_types:
-            G, s, Cbar = load_dataset(name, group_type)
-            T_L, _, _, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
-            for sel in selections:
-                print(f"Exp6 {name} {group_type} {METHOD_LABELS[sel]}")
-                df, _, _, _, _, eta_time = generalized_link_reweighting(
-                    G,
-                    s,
-                    Cbar,
-                    name,
-                    T_L=T_L,
-                    batch_size=args.batch_size,
-                    eta=args.eta,
-                    seed=args.seed,
-                    selection=sel,
-                    track_fiedler=False,
-                    betweenness_refresh=args.betweenness_refresh,
-                )
-                df["Name"] = name
-                df["Nominal Partition Type"] = group_type
-                df["Method"] = METHOD_LABELS[sel]
-                df["Number of Link Recommendations"] = T_L
-                df["Number of Sketch Vectors"] = q
-                df["Number of Nodes"] = G.number_of_nodes()
-                df["Batch Size"] = args.batch_size
-                df["Learning Rate"] = args.eta
-                df["Seed"] = args.seed
-                df["Time (s)"] = eta_time
-                df["Per Step Time (s)"] = eta_time / T_L
-                concat_df.append(df)
+    if args.cached_results:
+        df_all = pd.read_csv(f"{out_dir}/experiment_6_link_recommendation_baselines.csv")
+    else:
+        concat_df: List[pd.DataFrame] = []
 
-    df_all = pd.concat(concat_df, ignore_index=True)
-    df_all = df_all[np.isfinite(df_all["Percent Change"])].copy()
+        for name, group_types in datasets:
+            for group_type in group_types:
+                G, s, Cbar = load_dataset(name, group_type)
+                T_L, _, _, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
+                for sel in selections:
+                    print(f"Exp6 {name} {group_type} {METHOD_LABELS[sel]}")
+                    df, _, _, _, _, eta_time = generalized_link_reweighting(
+                        G,
+                        s,
+                        Cbar,
+                        name,
+                        T_L=T_L,
+                        batch_size=args.batch_size,
+                        eta=args.eta,
+                        seed=args.seed,
+                        selection=sel,
+                        track_fiedler=False,
+                        betweenness_refresh=args.betweenness_refresh,
+                    )
+                    df["Name"] = name
+                    df["Nominal Partition Type"] = group_type
+                    df["Method"] = METHOD_LABELS[sel]
+                    df["Number of Link Recommendations"] = T_L
+                    df["Number of Sketch Vectors"] = q
+                    df["Number of Nodes"] = G.number_of_nodes()
+                    df["Batch Size"] = args.batch_size
+                    df["Learning Rate"] = args.eta
+                    df["Seed"] = args.seed
+                    df["Time (s)"] = eta_time
+                    df["Per Step Time (s)"] = eta_time / T_L
+                    concat_df.append(df)
+
+        df_all = pd.concat(concat_df, ignore_index=True)
+        df_all = df_all[np.isfinite(df_all["Percent Change"])].copy()
     df_all.to_csv(f"{out_dir}/experiment_6_link_recommendation_baselines.csv", index=False)
 
     step_max = df_all["Step"].max()
@@ -1575,24 +2129,34 @@ def experiment_6_link_recommendation_baselines(args: argparse.Namespace) -> None
     metrics = ["Surrogate", "Disparity", "Polarization"]
     df_bar = df_last[df_last["Metric"].isin(metrics)].copy()
 
+    # format as the other catplot
+    df_bar["Method"] = df_bar["Method"].replace({
+        "Oracle (leverage)": "Ours",
+        "Random rewiring": "Random",
+        "Max-degree heuristic": "Degree",
+        "Max-betweenness heuristic": "Btwn",
+    })
+
+    num_names = df_bar["Name"].nunique()
+
     g = sns.catplot(
         data=df_bar,
         x="Method",
         y="Percent Change",
-        hue="Nominal Partition Type",
+        hue="Metric",
         col="Name",
-        row="Metric",
         kind="bar",
-        sharey=False,
-        height=2.8,
-        aspect=1.4,
+        sharey=True,
         legend=True,
+        height=4,
+        aspect=num_names / 2.5,
     )
-    g.figure.suptitle("Link recommendation (disparity): baselines vs oracle", y=1.02)
-    g.set_xticklabels(rotation=25, ha="right")
+
+    g.set_titles(template="{col_name}", fontsize=22) 
     g.tight_layout()
     g.savefig(f"{out_dir}/experiment_6a_link_recommendation_baselines.pdf", dpi=300, bbox_inches="tight")
     plt.close("all")
+
 
     partition_types_for_lines = sorted(
         set(df_all["Nominal Partition Type"].unique()) - {"polarization"},
@@ -1633,68 +2197,82 @@ def experiment_6_link_recommendation_baselines(args: argparse.Namespace) -> None
 
 
 def experiment_7_fiedler_baselines(args: argparse.Namespace) -> None:
-    """Fiedler maximization: oracle vs random / max-degree / max-betweenness."""
+    """Robust link recommendation (general correlation matrix): oracle vs random / max-degree / max-betweenness."""
     out_dir = args.out_dir
     datasets = get_datasets(args)
     selections = ["fiedler_grad", "random", "max_degree", "max_betweenness"]
-    concat_df: List[pd.DataFrame] = []
 
-    for name, group_types in datasets:
-        for group_type in group_types:
-            G, s, Cbar = load_dataset(name, group_type)
-            T_L, _, _, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
-            for sel in selections:
-                print(f"Exp7 {name} {group_type} {METHOD_LABELS[sel]}")
-                df, _, _, _, _, eta_time = generalized_link_reweighting(
-                    G,
-                    s,
-                    Cbar,
-                    name,
-                    T_L=T_L,
-                    batch_size=args.batch_size,
-                    eta=args.eta,
-                    seed=args.seed,
-                    selection=sel,
-                    track_fiedler=True,
-                    betweenness_refresh=args.betweenness_refresh,
-                )
-                df["Name"] = name
-                df["Nominal Partition Type"] = group_type
-                df["Method"] = METHOD_LABELS[sel]
-                df["Number of Link Recommendations"] = T_L
-                df["Number of Sketch Vectors"] = q
-                df["Number of Nodes"] = G.number_of_nodes()
-                df["Batch Size"] = args.batch_size
-                df["Learning Rate"] = args.eta
-                df["Seed"] = args.seed
-                df["Time (s)"] = eta_time
-                df["Per Step Time (s)"] = eta_time / T_L
-                concat_df.append(df)
+    if args.cached_results:
+        df_all = pd.read_csv(f"{out_dir}/experiment_7_fiedler_baselines.csv")
+    else:
+        concat_df: List[pd.DataFrame] = []
 
-    df_all = pd.concat(concat_df, ignore_index=True)
-    df_all = df_all[np.isfinite(df_all["Percent Change"])].copy()
+        for name, group_types in datasets:
+            for group_type in group_types:
+                G, s, Cbar = load_dataset(name, group_type)
+                T_L, _, _, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
+                for sel in selections:
+                    print(f"Exp7 {name} {group_type} {METHOD_LABELS[sel]}")
+                    df, _, _, _, _, eta_time = generalized_link_reweighting(
+                        G,
+                        s,
+                        Cbar,
+                        name,
+                        T_L=T_L,
+                        batch_size=args.batch_size,
+                        eta=args.eta,
+                        seed=args.seed,
+                        selection=sel,
+                        track_fiedler=True,
+                        betweenness_refresh=args.betweenness_refresh,
+                    )
+                    df["Name"] = name
+                    df["Nominal Partition Type"] = group_type
+                    df["Method"] = METHOD_LABELS[sel]
+                    df["Number of Link Recommendations"] = T_L
+                    df["Number of Sketch Vectors"] = q
+                    df["Number of Nodes"] = G.number_of_nodes()
+                    df["Batch Size"] = args.batch_size
+                    df["Learning Rate"] = args.eta
+                    df["Seed"] = args.seed
+                    df["Time (s)"] = eta_time
+                    df["Per Step Time (s)"] = eta_time / T_L
+                    concat_df.append(df)
+
+        df_all = pd.concat(concat_df, ignore_index=True)
+        df_all = df_all[np.isfinite(df_all["Percent Change"])].copy()
     df_all.to_csv(f"{out_dir}/experiment_7_fiedler_baselines.csv", index=False)
 
     step_max = df_all["Step"].max()
     df_last = df_all[df_all["Step"] == step_max].copy()
-    metrics = [r"Fiedler $\lambda_2$", "Surrogate", "Disparity", "Polarization"]
+    # metrics = [r"Fiedler $\lambda_2$", "Surrogate", "Disparity", "Polarization"]
+    metrics = ["Surrogate", "Disparity", "Polarization"]
     df_bar = df_last[df_last["Metric"].isin(metrics)].copy()
+
+    # rename baselines to shorter names
+    df_bar["Method"] = df_bar["Method"].replace({
+        "Oracle (Fiedler grad)": "Ours",
+        "Random rewiring": "Random",
+        "Max-degree heuristic": "Degree",
+        "Max-betweenness heuristic": "Btwn",
+    })
+
+    num_names = df_bar["Name"].nunique()
 
     g = sns.catplot(
         data=df_bar,
         x="Method",
         y="Percent Change",
-        hue="Nominal Partition Type",
+        hue="Metric",
         col="Name",
-        row="Metric",
         kind="bar",
-        sharey=False,
-        height=2.8,
-        aspect=1.4,
+        sharey=True,
         legend=True,
+        height=4,
+        aspect=num_names / 2.5,
     )
-    g.figure.suptitle("Fiedler maximization: baselines vs oracle", y=1.02)
-    g.set_xticklabels(rotation=25, ha="right")
+
+    g.set_titles(template="{col_name}", fontsize=22) 
     g.tight_layout()
     g.savefig(f"{out_dir}/experiment_7a_fiedler_baselines.pdf", dpi=300, bbox_inches="tight")
     plt.close("all")
@@ -1744,52 +2322,56 @@ def experiment_8_robust_link_recommendation_baselines(args: argparse.Namespace) 
     datasets = get_datasets(args)
     rho_values = np.array([0.1, 0.2, 0.3, 0.4, 0.5])
     inner_selections = ["leverage", "random", "max_degree", "max_betweenness"]
-    norm_constraints = ["spectral_ball"]
-    concat_df: List[pd.DataFrame] = []
+    norm_constraints = ["classifier_error"]
 
-    for name, group_types in datasets:
-        for group_type in group_types:
-            G, s, Cbar = load_dataset(name, group_type)
-            T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
-            for rho in rho_values:
-                for norm_constraint in norm_constraints:
-                    for sel in inner_selections:
-                        print(f"Exp8 {name} {group_type} rho={rho} {METHOD_LABELS[sel]}")
-                        df_outer, df_inner, eta_time = robust_link_recommendation_baseline(
-                            G=G,
-                            Cbar=Cbar,
-                            rho=rho,
-                            name=name,
-                            q=q,
-                            inner_selection=sel,
-                            norm_constraint=norm_constraint,
-                            T_L=T_L,
-                            T_C=T_C,
-                            K=K,
-                            batch_size=args.batch_size,
-                            eta_L=1.0,
-                            eta_C=2 * rho,
-                            seed=args.seed,
-                            betweenness_refresh=args.betweenness_refresh,
-                        )
-                        label = METHOD_LABELS[sel]
-                        df_inner["Method"] = label
-                        df_inner["Rho"] = rho
-                        df_outer["Method"] = label
-                        df_outer["Rho"] = rho
-                        df_inner["Name"] = name
-                        df_inner["Nominal Partition Type"] = group_type
-                        df_outer["Name"] = name
-                        df_outer["Nominal Partition Type"] = group_type
-                        df_inner["Time (s)"] = eta_time
-                        df_outer["Time (s)"] = eta_time
-                        steps = max(K * T_L * T_C, 1)
-                        df_inner["Per Step Time (s)"] = eta_time / steps
-                        df_outer["Per Step Time (s)"] = eta_time / steps
-                        concat_df.append(df_inner)
-                        concat_df.append(df_outer)
+    if args.cached_results:
+        df_all = pd.read_csv(f"{out_dir}/experiment_8_robust_link_recommendation_baselines.csv")
+    else:
+        concat_df: List[pd.DataFrame] = []
 
-    df_all = pd.concat(concat_df, ignore_index=True)
+        for name, group_types in datasets:
+            for group_type in group_types:
+                G, s, Cbar = load_dataset(name, group_type)
+                T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
+                for rho in rho_values:
+                    for norm_constraint in norm_constraints:
+                        for sel in inner_selections:
+                            print(f"Exp8 {name} {group_type} rho={rho} {METHOD_LABELS[sel]}")
+                            df_outer, df_inner, eta_time = robust_link_recommendation_baseline(
+                                G=G,
+                                Cbar=Cbar,
+                                rho=rho,
+                                name=name,
+                                q=q,
+                                inner_selection=sel,
+                                norm_constraint=norm_constraint,
+                                T_L=T_L,
+                                T_C=T_C,
+                                K=K,
+                                batch_size=args.batch_size,
+                                eta_L=1.0,
+                                eta_C=2 * rho,
+                                seed=args.seed,
+                                betweenness_refresh=args.betweenness_refresh,
+                            )
+                            label = METHOD_LABELS[sel]
+                            df_inner["Method"] = label
+                            df_inner["Rho"] = rho
+                            df_outer["Method"] = label
+                            df_outer["Rho"] = rho
+                            df_inner["Name"] = name
+                            df_inner["Nominal Partition Type"] = group_type
+                            df_outer["Name"] = name
+                            df_outer["Nominal Partition Type"] = group_type
+                            df_inner["Time (s)"] = eta_time
+                            df_outer["Time (s)"] = eta_time
+                            steps = max(K * T_L * T_C, 1)
+                            df_inner["Per Step Time (s)"] = eta_time / steps
+                            df_outer["Per Step Time (s)"] = eta_time / steps
+                            concat_df.append(df_inner)
+                            concat_df.append(df_outer)
+
+        df_all = pd.concat(concat_df, ignore_index=True)
     df_all.to_csv(f"{out_dir}/experiment_8_robust_link_recommendation_baselines.csv", index=False)
 
     df_outer = df_all[df_all["Metric"].str.startswith("Worst", na=False)].copy()
@@ -1816,16 +2398,37 @@ def experiment_8_robust_link_recommendation_baselines(args: argparse.Namespace) 
 
 
 def main(args: argparse.Namespace) -> None:
-    # experiment_1_link_recommendation_oracle(args)
-    # experiment_2_link_recommendation_oracle(args)
-    # experiment_3_worst_case_C_oracle(args, s_type='actual')
-    # experiment_4_robust_link_recommendation_oracle(args)
-    # experiment_5_fiedler_gradient_ascent(args)
-    experiment_6_link_recommendation_baselines(args)
-    experiment_7_fiedler_baselines(args)
-    # experiment_8_robust_link_recommendation_baselines(args)
+    experiment_dict = dict([
+        (1, experiment_1_link_recommendation_oracle),
+        (2, experiment_2_link_recommendation_oracle),
+        (3, experiment_3_worst_case_C_oracle),
+        (4, experiment_4_robust_link_recommendation_oracle),
+        (5, experiment_5_fiedler_gradient_ascent),
+        (6, experiment_6_link_recommendation_baselines),
+        (7, experiment_7_fiedler_baselines),
+        (8, experiment_8_robust_link_recommendation_baselines),
+    ])
+    
+    experiment_list = set()
+    for experiment_range in args.experiment_list:
+        if '-' in experiment_range:
+            start, end = experiment_range.split('-')
+            experiment_list.update(range(int(start), int(end) + 1))
+        elif experiment_range.isdigit():
+            experiment_list.add(int(experiment_range))
+        elif experiment_range == 'all':
+            experiment_list.update(experiment_dict.keys())
+        else:
+            raise ValueError(f"Invalid experiment range: {experiment_range}")
+
+    print(f"Running experiments: {list(experiment_list)}")
+
+    for experiment_id in experiment_list:
+       print(f"Running experiment {experiment_id}")
+       experiment_dict[experiment_id](args)
 
 if __name__ == "__main__":
     args = parse_args()
+    os.makedirs(args.out_dir, exist_ok=True)
     main(args)
 
