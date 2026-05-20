@@ -17,16 +17,29 @@ from tqdm import tqdm
 from utils import *
 import os
 rng = np.random.default_rng(0)
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
 
-sns.set_theme(style="whitegrid")
+sns.set_theme(
+    style="whitegrid",
+    palette="magma",
+    context="paper",
+    font_scale=1.75,
+    rc={
+        "font.size": 15,
+        "axes.labelsize": 17,
+        "axes.titlesize": 18,
+        "xtick.labelsize": 15,
+        "ytick.labelsize": 15,
+        "legend.fontsize": 14,
+        "legend.title_fontsize": 15,
+        "figure.titlesize": 19,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    },
+)
 
-# set palette to viridis
-sns.set_palette('magma')
-
-FIGSIZE = 5
-
-# set font scale to 1.5
-sns.set(font_scale=1.5)
+FIGSIZE = 5.5
 
 
 
@@ -77,14 +90,6 @@ def _append_auxiliary_inner_records(
     records.append(
         {
             "Step": i,
-            "Metric": "Intervention churn (cum. abs Δw)",
-            "Percent Change": float(100.0 * cum_abs_weight / den_m),
-            "Value": float(cum_abs_weight),
-        }
-    )
-    records.append(
-        {
-            "Step": i,
             "Metric": "Edges removed (cumulative)",
             "Percent Change": float(100.0 * edges_removed_cum / den_e),
             "Value": float(edges_removed_cum),
@@ -107,23 +112,10 @@ def _append_auxiliary_inner_records(
         }
     )
 
-def get_datasets(args: argparse.Namespace):
-    if args.size == 'tiny':
-        datasets = [('reddit', ['random'])]
-    elif args.size == 'small':
-        datasets = [('reddit', ['spectral', 'polarization']), ('twitter', ['spectral', 'polarization']), ('polblogs', ['spectral', 'polarization'])]
-    elif args.size == 'all':
-        datasets = [('twitter', ['spectral', 'label', 'polarization', 'random']), 
-                    ('polblogs', ['spectral', 'label', 'polarization', 'random']), 
-                    ('reddit', ['spectral', 'label', 'polarization', 'random'])]
-    else:
-        raise ValueError(f"Invalid size: {args.size}")
-
-    return datasets
     
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--experiment_list', type=str, nargs='+', default=['1-8'])
+    parser.add_argument('--experiment_list', type=str, nargs='+', default=['1'])
     parser.add_argument("--out-dir", type=str, default='figures')
     parser.add_argument("--rho", type=float, default=1.0)
     parser.add_argument('--eta', type=float, default=1.0)
@@ -132,20 +124,15 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--size', default='all', choices=['all', 'small', 'tiny'])
     parser.add_argument('--s_type', default='actual', choices=['actual', 'adversarial'])
-    parser.add_argument(
-        '--betweenness-refresh',
-        type=int,
-        default=1,
-        help='Recompute edge betweenness every k steps (1 = every step; larger speeds up max-betweenness baseline).',
-    )
+    parser.add_argument('--embedding_type', default='precomputed', choices=['node2vec', 'gaussian', 'network_structure', 'precomputed'])
     parser.add_argument('--cached_results', action='store_true')
     return parser.parse_args()
 
 
 def robust_link_recommendation(G: nx.Graph, Cbar: np.ndarray, rho: float, name: str, q: int, K: int = 10, T_L: int = 50, T_C: int = 20, eta_L: float = 1.0, eta_C: float = 2.0, batch_size: int = 100, seed: int = 0) -> None:
     L0 = sparse_laplacian(G)
-    U0, X0 = sketch_solve_X(L0, q, rng)
-    M0 = X0 @ X0
+    L0_plus_I = L0 + sp.identity(L0.shape[0], format="csr")
+    U0, R0, X0, M0 = sketch_solve(L0_plus_I, q, seed)
     H = G.copy()
     n = G.number_of_nodes()
 
@@ -242,14 +229,7 @@ def robust_link_recommendation(G: nx.Graph, Cbar: np.ndarray, rho: float, name: 
         if np.isclose(worst_surrogate_disparity_new, worst_surrogate_disparity_current, rtol=1e-6):
             break
 
-        print(
-            f"Worst case surrogate disparity improved from {worst_surrogate_disparity_current} "
-            f"to {worst_surrogate_disparity_new}"
-        )
-
         active_set.append((C_new, L, M, X, worst_surrogate_disparity_new, worst_disparity_new, worst_polarization_new))
-
-
 
         records_outer.append({
             'Name': name,
@@ -336,11 +316,8 @@ def link_recommendation(
     eps = 0.1
     q = max(int(np.log(n) / eps**2), 1)
     rng = np.random.default_rng(seed)
-    R = rng.choice([-1.0, 1.0], size=(n, q)).astype(np.float64)
     L_plus_I = L + sp.identity(n, format="csr")
-    U = sketch_solve(L_plus_I, R)
-    X = (U @ U.T) / q
-    M = X @ X
+    U, R, X, M = sketch_solve(L_plus_I, q, seed)
 
     T_refresh = int(np.sqrt(G.number_of_edges()))
 
@@ -388,9 +365,7 @@ def link_recommendation(
         cols = np.fromiter((edge_to_col[e] for e in edges), dtype=np.intp, count=len(edges))
         T = B[:, cols]
         coef = U.T @ T
-        norm_r_sq = np.sum(coef * coef, axis=0)
-        quad = np.sum(T * (C @ T), axis=0)
-        leverage_arr = norm_r_sq * quad
+        leverage_arr = np.sum(coef * coef, axis=0)
         idx_plus = int(np.argmax(leverage_arr))
         idx_minus = int(np.argmin(leverage_arr))
         edge_plus = edges[idx_plus]
@@ -430,15 +405,12 @@ def link_recommendation(
 
         if (i + 1) % T_refresh == 0:
             L_plus_I = L + sp.identity(n, format="csr")
-            U = sketch_solve(L_plus_I, R)
-        else:
-            U = sketch_U_sherman_morrison_two_rank(
-                U, q, weight_change, b_uv_plus.ravel(), b_uv_minus.ravel()
-            )
-
-        X = (U @ U.T) / q
-        M = X.T @ X # simplify with U 
+            U, R, X, M = sketch_solve(L_plus_I, q, seed)
         
+
+        M = (U @ U.T) / q
+        X = (U @ R.T) / q
+
         Z_tilde = X * C
         Z = M * C
 
@@ -494,7 +466,7 @@ def link_recommendation(
             initial_num_edges,
         )
 
-        progress_bar.set_description(f"Name: {name}, S: {surrogate_disparity}, D: {disparity}, P: {polarization}")
+        progress_bar.set_description(f"Name: {name}")
         progress_bar.update(1)
         progress_bar.refresh()
 
@@ -572,9 +544,7 @@ def fiedler_maximizing_link_recommendation(
     rng = np.random.default_rng(seed)
     R = rng.choice([-1.0, 1.0], size=(n, q)).astype(np.float64)
     L_plus_I = L + sp.identity(n, format="csr")
-    U = sketch_solve(L_plus_I, R)
-    X = (U @ U.T) / q
-    M = X @ X
+    U, R, X, M = sketch_solve(L_plus_I, q, seed)
 
     T_refresh = max(int(np.sqrt(max(G.number_of_edges(), 1))), 1)
 
@@ -638,14 +608,8 @@ def fiedler_maximizing_link_recommendation(
 
         if (i + 1) % T_refresh == 0:
             L_plus_I = L + sp.identity(n, format="csr")
-            U = sketch_solve(L_plus_I, R)
-        else:
-            U = sketch_U_sherman_morrison_two_rank(
-                U, q, weight_change, b_uv_plus.ravel(), b_uv_minus.ravel()
-            )
-
-        X = (U @ U.T) / q
-        M = X @ X
+            U, R, X, M = sketch_solve(L_plus_I, q, seed)
+        
 
         Z_tilde = X * C
         Z = M * C
@@ -851,9 +815,7 @@ def generalized_link_reweighting(
     rng = np.random.default_rng(seed)
     R = rng.choice([-1.0, 1.0], size=(n, q)).astype(np.float64)
     L_plus_I = L + sp.identity(n, format="csr")
-    U = sketch_solve(L_plus_I, R)
-    X = (U @ U.T) / q
-    M = X @ X
+    U, R, X, M = sketch_solve(L_plus_I, q, seed)
 
     T_refresh = max(int(np.sqrt(max(G.number_of_edges(), 1))), 1)
     records = []
@@ -968,14 +930,9 @@ def generalized_link_reweighting(
 
         if (i + 1) % T_refresh == 0:
             L_plus_I = L + sp.identity(n, format="csr")
-            U = sketch_solve(L_plus_I, R)
-        else:
-            U = sketch_U_sherman_morrison_two_rank(
-                U, q, weight_change, b_uv_plus.ravel(), b_uv_minus.ravel()
-            )
+            U, R, X, M = sketch_solve(L_plus_I, q, seed)
+        
 
-        X = (U @ U.T) / q
-        M = X @ X
         Z_tilde = X * C
         Z = M * C
 
@@ -1115,8 +1072,8 @@ def robust_link_recommendation_baseline(
 ) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
     """Like ``robust_link_recommendation`` but inner Laplacian updates use ``generalized_link_reweighting``."""
     L0 = sparse_laplacian(G)
-    U0, X0 = sketch_solve_X(L0, q, rng)
-    M0 = X0 @ X0
+    L0_plus_I = L0 + sp.identity(L0.shape[0], format="csr")
+    U0, R0, X0, M0 = sketch_solve(L0_plus_I, q, seed)
     n = G.number_of_nodes()
 
     initial_surrogate_disparity = float(top_eigenpair(X0 * Cbar)[0])
@@ -1201,7 +1158,7 @@ def robust_link_recommendation_baseline(
         )
 
         df_inner, L, X, M, H, L_eta_time = generalized_link_reweighting(
-            G=G,
+            G=G.copy(),
             s=None,
             C=C0,
             name=name,
@@ -1325,7 +1282,6 @@ _EXPERIMENT_4_AUX_INNER_METRICS = frozenset(
     {
         "Mean M cross-group",
         "Mean M within-group",
-        "Intervention churn (cum. abs Δw)",
         "Edges removed (cumulative)",
         "Intra-group abs weight Δ (cum.)",
         "Inter-group abs weight Δ (cum.)",
@@ -1335,7 +1291,6 @@ _EXPERIMENT_4_AUX_INNER_METRICS = frozenset(
 _EXPERIMENT_4_AUX_INNER_METRICS_ORDER = (
     "Mean M cross-group",
     "Mean M within-group",
-    "Intervention churn (cum. abs Δw)",
     "Edges removed (cumulative)",
     "Intra-group abs weight Δ (cum.)",
     "Inter-group abs weight Δ (cum.)",
@@ -1422,7 +1377,6 @@ def experiment_1_link_recommendation_oracle(args: argparse.Namespace):
     num_nominal_partition_types = concat_df['Nominal Partition Type'].nunique()
 
     fig_a, ax_a = plt.subplots(nrows=1, ncols=(1 + num_names), figsize=(FIGSIZE * (1 + num_names), FIGSIZE), squeeze=False)
-    fig_b, ax_b = plt.subplots(nrows=num_nominal_partition_types - 1, ncols=num_names, figsize=(FIGSIZE * num_names, FIGSIZE * (num_nominal_partition_types - 1)), squeeze=False)
     fig_c, ax_c = plt.subplots(nrows=1, ncols=num_names, figsize=(FIGSIZE * num_names, FIGSIZE), squeeze=False)
 
     alpha = 0.1
@@ -1436,23 +1390,10 @@ def experiment_1_link_recommendation_oracle(args: argparse.Namespace):
         ax_a[0, i].set_title(name)
         ax_a[0, i].set_ylim(min_percent_change, max_percent_change)
 
-
         sns.barplot(x='Nominal Partition Type', y='Per Step Time (s)', data=df_name, ax=ax_c[0, i], dodge=True, legend=(i == num_names - 1))
        
         ax_c[0, i].set_title(name)
 
-        for j, nominal_partition_type in enumerate(set(concat_df['Nominal Partition Type'].unique()) - {'polarization'}):
-            df_b = df_name[df_name['Nominal Partition Type'] == nominal_partition_type].copy()
-            sns.lineplot(x='Step', y='Percent Change', hue='Metric', data=df_b, ax=ax_b[j, i], legend=(i == num_names - 1) and (j == num_nominal_partition_types - 2))
-            ax_b[j, i].set_ylim(min_percent_change, max_percent_change)
-            if i == 0:
-                ax_b[j, i].set_ylabel(nominal_partition_type)
-            if j == 0:
-                ax_b[j, i].set_xlabel('Step')
-            if i == 0:
-                ax_b[j, i].set_title(name)
-
-        ax_b[0, i].set_title(name)
 
     # sort concat_df by Number of Nodes
     concat_df = concat_df.sort_values(by='Number of Nodes')
@@ -1465,9 +1406,6 @@ def experiment_1_link_recommendation_oracle(args: argparse.Namespace):
     max_number_of_nodes = int((1 + alpha) * concat_df['Number of Nodes'].max())
 
     n_range = np.arange(min_number_of_nodes, max_number_of_nodes, 50)
-    # nominal_runtime = n_range * np.log(n_range) / args.eps**4
-    # ax_a[0, -1].plot(n_range, nominal_runtime, label='Upper bound $O(n \\log n / \\epsilon^4)$', color='red', linestyle='--')
-    ax_a[0, -1].legend(loc='upper right')
     ax_a[0, -1].set_title('Runtime of Link Recommendation Oracle')
     ax_a[0, -1].set_xlabel('Number of Nodes')
     ax_a[0, -1].set_ylabel('Runtime (s)')
@@ -1478,10 +1416,6 @@ def experiment_1_link_recommendation_oracle(args: argparse.Namespace):
     fig_a.suptitle('Link Recommendation Oracle (Step 1)')
     fig_a.tight_layout()
     fig_a.savefig(f'{out_dir}/experiment_1a_link_recommendation_oracle.pdf', dpi=300, bbox_inches='tight')
-
-    fig_b.suptitle('Link Recommendation Oracle (Step 1)')
-    fig_b.tight_layout()
-    fig_b.savefig(f'{out_dir}/experiment_1b_link_recommendation_oracle.pdf', dpi=300, bbox_inches='tight')
 
     fig_c.suptitle('Per Step Time of Link Recommendation Oracle (Step 1)')
     fig_c.tight_layout()
@@ -1565,8 +1499,6 @@ def experiment_2_link_recommendation_oracle(args: argparse.Namespace):
 
             ax_a[j, i].set_xlabel(scenario_type)   
 
-            ax_a[j, i].set_ylim(0, 120)
-
     fig_a.suptitle('Impact of Platform Intervention as a Function of Uncertainty')
     fig_a.tight_layout()
     fig_a.savefig(f'{out_dir}/experiment_2a_link_recommendation_oracle.pdf', dpi=300, bbox_inches='tight')
@@ -1585,8 +1517,6 @@ def experiment_3_worst_case_C_oracle(args: argparse.Namespace):
 
         rho_values = np.array([0.1, 0.2, 0.3, 0.4, 0.5])
 
-        rng = np.random.default_rng(0)
-
         records = []
 
         for name, group_types in datasets:
@@ -1595,8 +1525,8 @@ def experiment_3_worst_case_C_oracle(args: argparse.Namespace):
                 G, s, Cbar = load_dataset(name, group_type)
                 T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
                 L = sparse_laplacian(G)
-                U, X = sketch_solve_X(L, q, rng)
-                M = X @ X
+                L_plus_I = L + sp.identity(L.shape[0], format="csr")
+                U, R, X, M = sketch_solve(L_plus_I, q, seed)
 
                 for rho in rho_values:
                     print(f'Classifier error rho = {rho}')
@@ -1673,7 +1603,7 @@ def experiment_3_worst_case_C_oracle(args: argparse.Namespace):
         ax_a[0, i].set_ylim(0, 120)
 
     df_time = concat_df[concat_df['Metric'].isin(['Time (s)'])].copy()
-    sns.scatterplot(x='Number of Nodes', y='Value', hue='Rho', data=df_time, ax=ax_a[0, -1], legend=False)
+    sns.scatterplot(x='Number of Nodes', y='Value', hue='Rho', data=df_time, ax=ax_a[0, -1], legend=False, markersize=15)
     ax_a[0, -1].set_title('Time')
     ax_a[0, -1].set_xlabel('Number of Nodes')
     ax_a[0, -1].set_ylabel('Time (s)')
@@ -1704,12 +1634,12 @@ def experiment_4_robust_link_recommendation_oracle(args: argparse.Namespace):
                 G, s, Cbar = load_dataset(name, group_type)
                 T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
 
-                K = 3
+                # K = 3
 
                 for rho in rho_values:
                     print(f'Classifier error rho = {rho}')
 
-                    df_inner, df_outer, eta_time, M0, M = robust_link_recommendation(G=G, Cbar=Cbar, rho=rho, name=name, q=q, T_L=T_L, T_C=T_C, K=K, batch_size=args.batch_size, eta_L=1.0, eta_C=2*rho, seed=args.seed)
+                    df_inner, df_outer, eta_time, M0, M = robust_link_recommendation(G=G.copy(), Cbar=Cbar, rho=rho, name=name, q=q, T_L=T_L, T_C=T_C, K=K, batch_size=args.batch_size, eta_L=1.0, eta_C=2*rho, seed=args.seed)
                     
                     df_inner['Time (s)'] = eta_time
                     df_outer['Time (s)'] = eta_time
@@ -1765,7 +1695,7 @@ def experiment_4_robust_link_recommendation_oracle(args: argparse.Namespace):
         df_name = plot_df[plot_df['Name'] == name].copy()
         sns.barplot(x='Rho', y='Percent Change', hue='Metric', data=df_bar[(df_bar['Name'] == name) & (df_bar['Metric'].isin(['Surrogate', 'Disparity']))], ax=ax_a[0, i], dodge=True, legend=(i == num_names - 1))
         ax_a[0, i].set_title(name)
-        ax_a[0, i].set_ylim(min_percent_change, max_percent_change)
+        # ax_a[0, i].set_ylim(min_percent_change, max_percent_change)
 
         df_time = df_name.drop_duplicates(subset=['Rho'], keep='first')
         sns.barplot(x='Rho', y='Per Step Time (s)', data=df_time, ax=ax_c[0, i], dodge=True, legend=(i == num_names - 1))
@@ -1843,7 +1773,12 @@ def experiment_4_robust_link_recommendation_oracle(args: argparse.Namespace):
             if i == 0:
                 ax_d[0, i].set_ylabel("Percent change")
         
+
         fig_d.tight_layout()
+        
+        # move legend to the outside of the plot
+        ax_d[0, i].legend(loc='upper left', bbox_to_anchor=(1, 1))
+
         fig_d.savefig(
             f"{out_dir}/experiment_4d_robust_link_recommendation_oracle.pdf",
             dpi=300,
@@ -1879,8 +1814,13 @@ def experiment_4_robust_link_recommendation_oracle(args: argparse.Namespace):
             ax_e[0, i].set_title(name)
             ax_e[0, i].set_xlabel(r"$\rho$")
             if i == 0:
-                ax_e[0, i].set_ylabel(r"$\|C_k - \bar C\|$")
+                ax_e[0, i].set_ylabel(r"$\|C_{{new}} - \bar C\|$")
+            else:
+                ax_e[0, i].set_ylabel('')
         
+        # move legend to the outside of the plot
+        if i == num_names - 1:
+            ax_e[0, i].legend(loc='upper left', bbox_to_anchor=(1, 1))
         fig_e.tight_layout()
         fig_e.savefig(
             f"{out_dir}/experiment_4e_robust_link_recommendation_oracle.pdf",
@@ -2048,6 +1988,7 @@ def experiment_5_fiedler_gradient_ascent(args: argparse.Namespace):
         data=concat_df,
         ax=ax_a[0, -1],
         style='Name',
+        markersize=15,
     )
 
     alpha = 0.05
@@ -2078,10 +2019,10 @@ def experiment_5_fiedler_gradient_ascent(args: argparse.Namespace):
 
 
 def experiment_6_link_recommendation_baselines(args: argparse.Namespace) -> None:
-    """Disparity-focused reweighting: oracle vs random / max-degree / max-betweenness."""
+    """Disparity-focused reweighting baselines: random vs max-degree."""
     out_dir = args.out_dir
     datasets = get_datasets(args)
-    selections = ["leverage", "random", "max_degree", "max_betweenness"]
+    selections = ["random", "max_degree"]
 
     if args.cached_results:
         df_all = pd.read_csv(f"{out_dir}/experiment_6_link_recommendation_baselines.csv")
@@ -2089,7 +2030,7 @@ def experiment_6_link_recommendation_baselines(args: argparse.Namespace) -> None
         concat_df: List[pd.DataFrame] = []
 
         for name, group_types in datasets:
-            for group_type in group_types:
+            for group_type in set(group_types) - {'polarization'}:
                 G, s, Cbar = load_dataset(name, group_type)
                 T_L, _, _, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
                 for sel in selections:
@@ -2122,6 +2063,8 @@ def experiment_6_link_recommendation_baselines(args: argparse.Namespace) -> None
 
         df_all = pd.concat(concat_df, ignore_index=True)
         df_all = df_all[np.isfinite(df_all["Percent Change"])].copy()
+    allowed_methods = {METHOD_LABELS[sel] for sel in selections}
+    df_all = df_all[df_all["Method"].isin(allowed_methods)].copy()
     df_all.to_csv(f"{out_dir}/experiment_6_link_recommendation_baselines.csv", index=False)
 
     step_max = df_all["Step"].max()
@@ -2131,10 +2074,8 @@ def experiment_6_link_recommendation_baselines(args: argparse.Namespace) -> None
 
     # format as the other catplot
     df_bar["Method"] = df_bar["Method"].replace({
-        "Oracle (leverage)": "Ours",
         "Random rewiring": "Random",
         "Max-degree heuristic": "Degree",
-        "Max-betweenness heuristic": "Btwn",
     })
 
     num_names = df_bar["Name"].nunique()
@@ -2148,11 +2089,11 @@ def experiment_6_link_recommendation_baselines(args: argparse.Namespace) -> None
         kind="bar",
         sharey=True,
         legend=True,
-        height=4,
+        height=5.5,
         aspect=num_names / 2.5,
     )
 
-    g.set_titles(template="{col_name}", fontsize=22) 
+    g.set_titles(template="{col_name}")
     g.tight_layout()
     g.savefig(f"{out_dir}/experiment_6a_link_recommendation_baselines.pdf", dpi=300, bbox_inches="tight")
     plt.close("all")
@@ -2197,10 +2138,10 @@ def experiment_6_link_recommendation_baselines(args: argparse.Namespace) -> None
 
 
 def experiment_7_fiedler_baselines(args: argparse.Namespace) -> None:
-    """Robust link recommendation (general correlation matrix): oracle vs random / max-degree / max-betweenness."""
+    """Robust link recommendation baselines (general correlation matrix): random vs max-degree."""
     out_dir = args.out_dir
     datasets = get_datasets(args)
-    selections = ["fiedler_grad", "random", "max_degree", "max_betweenness"]
+    selections = ["random", "max_degree"]
 
     if args.cached_results:
         df_all = pd.read_csv(f"{out_dir}/experiment_7_fiedler_baselines.csv")
@@ -2241,6 +2182,8 @@ def experiment_7_fiedler_baselines(args: argparse.Namespace) -> None:
 
         df_all = pd.concat(concat_df, ignore_index=True)
         df_all = df_all[np.isfinite(df_all["Percent Change"])].copy()
+    allowed_methods = {METHOD_LABELS[sel] for sel in selections}
+    df_all = df_all[df_all["Method"].isin(allowed_methods)].copy()
     df_all.to_csv(f"{out_dir}/experiment_7_fiedler_baselines.csv", index=False)
 
     step_max = df_all["Step"].max()
@@ -2249,12 +2192,10 @@ def experiment_7_fiedler_baselines(args: argparse.Namespace) -> None:
     metrics = ["Surrogate", "Disparity", "Polarization"]
     df_bar = df_last[df_last["Metric"].isin(metrics)].copy()
 
-    # rename baselines to shorter names
+    # rename methods to shorter names
     df_bar["Method"] = df_bar["Method"].replace({
-        "Oracle (Fiedler grad)": "Ours",
         "Random rewiring": "Random",
         "Max-degree heuristic": "Degree",
-        "Max-betweenness heuristic": "Btwn",
     })
 
     num_names = df_bar["Name"].nunique()
@@ -2268,11 +2209,11 @@ def experiment_7_fiedler_baselines(args: argparse.Namespace) -> None:
         kind="bar",
         sharey=True,
         legend=True,
-        height=4,
+        height=5.5,
         aspect=num_names / 2.5,
     )
 
-    g.set_titles(template="{col_name}", fontsize=22) 
+    g.set_titles(template="{col_name}")
     g.tight_layout()
     g.savefig(f"{out_dir}/experiment_7a_fiedler_baselines.pdf", dpi=300, bbox_inches="tight")
     plt.close("all")
@@ -2321,7 +2262,7 @@ def experiment_8_robust_link_recommendation_baselines(args: argparse.Namespace) 
     out_dir = args.out_dir
     datasets = get_datasets(args)
     rho_values = np.array([0.1, 0.2, 0.3, 0.4, 0.5])
-    inner_selections = ["leverage", "random", "max_degree", "max_betweenness"]
+    inner_selections = ["random", "max_degree"]
     norm_constraints = ["classifier_error"]
 
     if args.cached_results:
@@ -2372,11 +2313,18 @@ def experiment_8_robust_link_recommendation_baselines(args: argparse.Namespace) 
                             concat_df.append(df_outer)
 
         df_all = pd.concat(concat_df, ignore_index=True)
+    allowed_methods = {METHOD_LABELS[sel] for sel in inner_selections}
+    df_all = df_all[df_all["Method"].isin(allowed_methods)].copy()
     df_all.to_csv(f"{out_dir}/experiment_8_robust_link_recommendation_baselines.csv", index=False)
 
     df_outer = df_all[df_all["Metric"].str.startswith("Worst", na=False)].copy()
     if len(df_outer) == 0:
         return
+
+    # remove worst polarization metric
+    df_outer = df_outer[df_outer["Metric"] != "Worst Polarization"]
+
+    df_outer = df_outer[df_outer["Nominal Partition Type"].isin(set(df_outer["Nominal Partition Type"].unique()) - {"polarization"})].copy()
 
     g = sns.relplot(
         data=df_outer,
@@ -2385,17 +2333,277 @@ def experiment_8_robust_link_recommendation_baselines(args: argparse.Namespace) 
         hue="Method",
         style="Metric",
         col="Name",
-        row="Nominal Partition Type",
         kind="line",
         markers=True,
         dashes=False,
-        facet_kws={"sharey": False},
+        facet_kws={"sharey": True},
     )
-    g.figure.suptitle("Robust link recommendation: inner-loop baselines (outer metrics vs $\\rho$)", y=1.02)
+    g.set_titles(template="{col_name}")
+    g.figure.suptitle("Comparison with baselines")
     g.tight_layout()
     g.savefig(f"{out_dir}/experiment_8a_robust_link_recommendation_baselines.pdf", dpi=300, bbox_inches="tight")
     plt.close("all")
 
+def experiment_9_predictive_model(args: argparse.Namespace) -> None:
+    out_dir = args.out_dir
+    # datasets = [('twitch-RU', ['label'])]
+    datasets = get_datasets(args)   
+    train_data_fractions = np.array([0.05, 0.1])
+    train_val_split = 0.8
+
+    if args.cached_results:
+        df_all = pd.read_csv(f"{out_dir}/experiment_9_predictive_model.csv")
+    else:
+        concat_df: List[pd.DataFrame] = []
+        rng_local = np.random.default_rng(args.seed)
+
+        for name, group_types in datasets:
+            for group_type in group_types:
+                G, s, Cbar, labels = load_dataset(name, group_type, return_labels=True)
+                embeddings_filename = f"data/{name}/embeddings.npy"
+                labels = (labels > 0).astype(float)
+                labels = labels.reshape(-1, 1)
+                
+                if args.embedding_type == 'precomputed' and os.path.exists(embeddings_filename):
+                    embeddings = np.load(embeddings_filename)
+                elif args.embedding_type == 'node2vec':
+                    print("training embeddings for ", name, group_type)
+                    model = Node2Vec(dimensions=64, walk_length=30, workers=4)
+                    model.fit(G)
+                    embeddings = model.get_embedding()
+                    np.save(embeddings_filename, embeddings)
+                elif args.embedding_type == 'gaussian':
+                    embeddings = np.random.normal(0, 1, size=(len(G.nodes()), 32), random_state=args.seed)
+                elif args.embedding_type == 'network_structure':                    
+                    degree = np.array([G.degree(i) for i in G.nodes()]).reshape(-1, 1)
+                    betweeness = nx.betweenness_centrality(G)
+                    clustering = nx.clustering(G)
+                    betweeness_scores = np.array([betweeness[i] for i in G.nodes()]).reshape(-1, 1)
+                    clustering_coefficients = np.array([clustering[i] for i in G.nodes()]).reshape(-1, 1)
+                    embeddings = np.concatenate([degree, betweeness_scores, clustering_coefficients], axis=1)
+                else:
+                    raise ValueError(f"Invalid embedding type: {args.embedding_type}")
+        
+                n_labels = len(labels)
+                for train_data_fraction in train_data_fractions:
+                    train_size = max(2, int(train_data_fraction * n_labels))
+                    val_size = max(1, int((1 - train_val_split) * train_size))
+                    train_size = min(train_size, n_labels - 2)
+                    val_size = min(val_size, n_labels - train_size - 1)
+                    if train_size <= val_size or val_size <= 0:
+                        continue
+                    
+                    train_indices = []
+                    val_indices = []
+                    for label in np.unique(labels):
+                        label_indices = np.where(labels == label)[0]
+                        rng_local.shuffle(label_indices)
+                        train_indices.extend(label_indices[:train_size // len(np.unique(labels))])
+                        val_indices.extend(label_indices[train_size // len(np.unique(labels)) : train_size // len(np.unique(labels)) + val_size // len(np.unique(labels))])
+
+                    train_indices = np.array(train_indices)
+                    val_indices = np.array(val_indices)
+                    
+                    train_embeddings = embeddings[train_indices]
+                    val_embeddings = embeddings[val_indices]
+                    train_labels = labels[train_indices].flatten()
+                    val_labels = labels[val_indices].flatten()
+
+                    model = LogisticRegression(max_iter=1000)
+                    model.fit(train_embeddings, train_labels)
+
+
+                    val_predictions = model.predict(val_embeddings)
+
+                    accuracy = float(np.mean(val_predictions == val_labels))
+                    print(f"Validation Accuracy for {name} {group_type} {train_data_fraction}: {accuracy}")
+
+                    train_val_indices = np.concatenate([train_indices, val_indices])
+                    all_indices = np.arange(n_labels)
+
+                    test_indices = np.setdiff1d(all_indices, train_val_indices)
+                    test_embeddings = embeddings[test_indices]
+                    test_labels = labels[test_indices].flatten()
+                    test_predictions = model.predict(test_embeddings)
+                    test_accuracy = float(np.mean(test_predictions == test_labels))
+
+                    label_predictions = labels.copy()
+
+                    val_labels = 2 * (val_labels > 0.5).astype(float) - 1
+                    test_labels = 2 * (test_labels > 0.5).astype(float) - 1
+
+                    val_labels = val_labels.reshape(-1, 1)
+                    test_labels = test_labels.reshape(-1, 1)
+
+                    label_predictions[val_indices] = val_labels
+                    label_predictions[test_indices] = test_labels
+
+                    label_predictions = label_predictions.reshape(-1, 1)
+
+                    Cbar_pred = label_predictions @ label_predictions.T
+
+                    
+                    print(f"Test Accuracy for {name} {group_type} {train_data_fraction}: {test_accuracy}")
+
+                    rho = (1 - train_data_fraction) * (1 - accuracy)
+                    T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
+                    
+                    # K = 3
+                    df_inner, df_outer, eta_time, _, _ = robust_link_recommendation(
+                        G=G.copy(),
+                        Cbar=Cbar_pred,
+                        rho=rho,
+                        name=name,
+                        q=q,
+                        K=K,
+                        T_L=T_L,
+                        T_C=T_C,
+                        eta_L=1.0,
+                        eta_C=2 * rho,
+                        batch_size=args.batch_size,
+                        seed=args.seed,
+                    )
+
+                    steps = max(K * T_C * T_L, 1)
+                    for df in (df_outer, df_inner):
+                        df["Name"] = name
+                        df["Nominal Partition Type"] = group_type
+                        df["Accuracy"] = test_accuracy
+                        df["Rho"] = rho
+                        df["Fraction of Training Data"] = train_data_fraction * 100
+                        df["Number of Link Recommendations"] = T_L
+                        df["Number of Sketch Vectors"] = q
+                        df["Number of Nodes"] = G.number_of_nodes()
+                        df["Batch Size"] = args.batch_size
+                        df["Learning Rate"] = args.eta
+                        df["Seed"] = args.seed
+                        df["Time (s)"] = eta_time
+                        df["Per Step Time (s)"] = eta_time / steps
+                        df["Method"] = "Predictive Model"
+
+                    concat_df.append(df_outer)
+                    concat_df.append(df_inner)
+
+        df_all = pd.concat(concat_df, ignore_index=True) if concat_df else pd.DataFrame()
+
+    if df_all.empty:
+        return
+
+    df_all.to_csv(f"{out_dir}/experiment_9_predictive_model.csv", index=False)
+
+    plot_df = df_all.copy()
+    frac_values_sorted = sorted(plot_df["Fraction of Training Data"].dropna().unique())
+    num_fracs = len(frac_values_sorted)
+    name_list = list(plot_df["Name"].dropna().unique())
+    num_names = len(name_list)
+    if num_names == 0:
+        return
+
+    df_outer = plot_df[plot_df["Metric"].str.startswith("Worst", na=False)].dropna(subset=["k"]).copy()
+    if df_outer.empty:
+        return
+    df_outer = df_outer[df_outer["Metric"].isin(["Worst Surrogate Disparity", "Worst Disparity"])]
+    if df_outer.empty:
+        return
+
+    idx_max = df_outer.groupby(["Name", "Fraction of Training Data", "Metric"])["k"].transform("max")
+    df_bar = df_outer[df_outer["k"] == idx_max].copy()
+
+    alpha = 0.1
+    min_percent_change = (1 + alpha) * df_outer["Percent Change"].min()
+    max_percent_change = (1 + alpha) * df_outer["Percent Change"].max()
+
+    fig_a, ax_a = plt.subplots(
+        nrows=1,
+        ncols=(1 + num_names),
+        figsize=(FIGSIZE * (1 + num_names), FIGSIZE),
+        squeeze=False,
+    )
+    fig_b, ax_b = plt.subplots(
+        nrows=num_fracs,
+        ncols=num_names,
+        figsize=(FIGSIZE * num_names, FIGSIZE * num_fracs),
+        squeeze=False,
+        sharey=True,
+    )
+    fig_c, ax_c = plt.subplots(
+        nrows=1,
+        ncols=num_names,
+        figsize=(FIGSIZE * num_names, FIGSIZE),
+        squeeze=False,
+        sharey=True,
+    )
+
+    for i, name in enumerate(name_list):
+        sub_bar = df_bar[df_bar["Name"] == name].copy()
+        sns.barplot(
+            x="Fraction of Training Data",
+            y="Percent Change",
+            hue="Metric",
+            data=sub_bar,
+            ax=ax_a[0, i],
+            dodge=True,
+            legend=(i == num_names - 1),
+        )
+        ax_a[0, i].set_title(name)
+        ax_a[0, i].set_xlabel("Fraction of training data")
+        ax_a[0, i].set_ylim(min_percent_change, max_percent_change)
+
+        df_time = plot_df[plot_df["Name"] == name].drop_duplicates(
+            subset=["Fraction of Training Data"],
+            keep="first",
+        )
+        sns.barplot(
+            x="Fraction of Training Data",
+            y="Per Step Time (s)",
+            data=df_time,
+            ax=ax_c[0, i],
+            dodge=True,
+            legend=False,
+        )
+        ax_c[0, i].set_title(name)
+        ax_c[0, i].set_xlabel("Fraction of training data")
+
+        for j, frac in enumerate(frac_values_sorted):
+            df_line = df_outer[
+                (df_outer["Name"] == name)
+                & (df_outer["Fraction of Training Data"] == frac)
+            ].copy()
+            sns.lineplot(
+                x="k",
+                y="Percent Change",
+                hue="Metric",
+                data=df_line,
+                ax=ax_b[j, i],
+                legend=(i == num_names - 1) and (j == num_fracs - 1),
+            )
+            ax_b[j, i].set_ylim(min_percent_change, max_percent_change)
+            if i == 0:
+                ax_b[j, i].set_ylabel(f"train frac = {frac:.1f}")
+            if j == num_fracs - 1:
+                ax_b[j, i].set_xlabel("Outer iteration (k)")
+            if j == 0:
+                ax_b[j, i].set_title(name)
+
+    sns.barplot(x='Fraction of Training Data', y='Accuracy', hue='Name', data=plot_df, ax=ax_a[0, -1], dodge=True, legend=True)
+    ax_a[0, -1].set_xlabel("Fraction of training data")
+    ax_a[0, -1].set_ylabel("Test Accuracy")
+
+    plot_df_sorted = plot_df.sort_values(by="Number of Nodes")
+    df_rt = plot_df_sorted.drop_duplicates(subset=["Name", "Fraction of Training Data"], keep="first")
+    
+    fig_a.tight_layout()
+    fig_a.savefig(f"{out_dir}/experiment_9a_predictive_model.pdf", dpi=300, bbox_inches="tight")
+
+    fig_b.suptitle("Predictive-model robust recommendation")
+    fig_b.tight_layout()
+    fig_b.savefig(f"{out_dir}/experiment_9b_predictive_model.pdf", dpi=300, bbox_inches="tight")
+
+    fig_c.suptitle("Per-step time of predictive-model robust recommendation")
+    fig_c.tight_layout()
+    fig_c.savefig(f"{out_dir}/experiment_9c_predictive_model.pdf", dpi=300, bbox_inches="tight")
+
+    plt.close("all")
 
 def main(args: argparse.Namespace) -> None:
     experiment_dict = dict([
@@ -2407,6 +2615,7 @@ def main(args: argparse.Namespace) -> None:
         (6, experiment_6_link_recommendation_baselines),
         (7, experiment_7_fiedler_baselines),
         (8, experiment_8_robust_link_recommendation_baselines),
+        (9, experiment_9_predictive_model)
     ])
     
     experiment_list = set()

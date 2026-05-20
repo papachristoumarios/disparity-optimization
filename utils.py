@@ -16,6 +16,12 @@ import time
 Array = np.ndarray
 Edge = Union[Tuple[int, int], Tuple[str, str]]
 
+def get_datasets(args: argparse.Namespace):
+    datasets = [('reddit', ['spectral']), 
+                ('twitter', ['spectral']), 
+                ('polblogs', ['spectral'])]
+    return datasets
+
 def load_weighted_undirected_graph(edge_file: str) -> nx.Graph:
     df = pd.read_csv(edge_file, header=None, sep=None, engine="python")
     if df.shape[1] < 2:
@@ -131,7 +137,7 @@ def compute_polarization(solve, s: np.ndarray, M: sp.csr_matrix, Z: sp.csr_matri
 def compute_disparity(s: np.ndarray, M: sp.csr_matrix, Z: sp.csr_matrix) -> float:
     return float(s.T @ M @ Z @ s)
 
-def load_dataset(name, group_type):
+def load_dataset(name, group_type, return_labels: bool = False):
     """Load dataset from name and group type."""
     G = load_weighted_undirected_graph(f'data/{name}/edges.txt')
     G = largest_connected_component(G)
@@ -170,7 +176,10 @@ def load_dataset(name, group_type):
 
     s = build_opinion_vector(np.array([opinion_map[n] for n in nodes], dtype=float))
 
-    return G, s, Cbar
+    if return_labels:
+        return G, s, Cbar, labels
+    else:
+        return G, s, Cbar
 
 def sparse_laplacian(G: nx.Graph, nodelist: Optional[Sequence[int]] = None) -> sp.csr_matrix:
     """Return the weighted Laplacian matrix as CSR."""
@@ -353,7 +362,7 @@ def worst_case_C_for_fixed_L(
     return C, eta_time
 
 
-def sketch_solve(A: sp.csr_matrix, R: np.ndarray) -> np.ndarray:
+def sketch_solve_helper(A: Union[sp.csr_matrix, np.ndarray], R: np.ndarray) -> np.ndarray:
     n, q = R.shape
     if A.shape[0] != n:
         raise ValueError("A and R must agree in row dimension.")
@@ -370,7 +379,7 @@ def sketch_U_sherman_morrison_two_rank(
     a: np.ndarray,
     c: np.ndarray,
     denom_eps: float = 1e-14,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     if w == 0.0:
         return U
     u_vec = np.sqrt(w) * np.asarray(a, dtype=np.float64).ravel()
@@ -397,18 +406,6 @@ def sketch_U_sherman_morrison_two_rank(
     return U1 + np.outer(X1_z, g) / d2
 
 
-def sketch_solve_X(L: sp.csr_matrix, q: int, seed: int = 0, return_X: bool = False) -> np.ndarray:
-    # L + I sparse matrix
-    L_plus_I = L + sp.eye(L.shape[0], format="csr")
-    rng = np.random.default_rng(seed)
-    R = rng.standard_normal((L.shape[0], q))
-    U = sketch_solve(L_plus_I, R)
-    
-    if return_X:
-        X_approx = U @ U.T / q
-        return U, X_approx
-    else:
-        return U, None
 def cholesky_add_node(L, z, z_uu, jitter=1e-12):
     """
     Append one node to the Cholesky factor of Z_SS.
@@ -695,10 +692,18 @@ def generate_correlation_matrix_scenario(Cbar: np.ndarray, mode: str, **kwargs) 
 
     return C
 
-def sketch_solve_X(L: sp.csr_matrix, q: int, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray]:
-    n = L.shape[0]
-    L_plus_I = L + sp.identity(n, format="csr")
-    R = rng.choice([-1.0, 1.0], size=(n, q)).astype(np.float64)
-    U = sketch_solve(L_plus_I, R)
-    X = (U @ U.T) / q
-    return U, X
+
+def sketch_solve(A, q=None, seed=None):
+    rng = np.random.default_rng(seed)
+    n = A.shape[0]
+
+    # Rademacher sketch matrix R
+    R = rng.choice([-1.0, 1.0], size=(n, q))
+
+    # Sketch for X = A^{-1}: solve A U_X = R
+    U = sketch_solve_helper(A, R)         # shape (n, q)
+
+    X = (U @ R.T) / q
+    M = (U @ U.T) / q
+
+    return U, R, X, M
