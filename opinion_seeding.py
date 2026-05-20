@@ -23,9 +23,6 @@ from utils import *
 
 import seaborn as sns
 import matplotlib.pyplot as plt
-from scipy.linalg import solve_triangular
-from scipy.linalg import cho_factor, cho_solve, eigh
-
 from dataclasses import dataclass
 
 sns.set_theme(
@@ -94,6 +91,74 @@ def cholesky_add_node(L, z, z_uu, jitter=1e-12):
     L_new[m, m] = np.sqrt(alpha)
     return L_new, alpha
 
+def marginal_gain_for_node(
+    Z: np.ndarray,
+    Q: Optional[np.ndarray],
+    s: np.ndarray,
+    S_idx: np.ndarray,
+    u: int,
+) -> Tuple[float, Optional[np.ndarray], float]:
+    """
+    Marginal benefit of adding u to S for F(S) = s^T P_S s:
+        gain = (s^T q_u)^2 / alpha,  q_u = Z_{:,u} - Z_{:,S} Z_SS^{-1} Z_{S,u}.
+    """
+    ui = int(u)
+    if len(S_idx) == 0:
+        alpha = float(Z[ui, ui])
+        if alpha <= 1e-12:
+            return 0.0, None, alpha
+        q_u = Z[:, ui]
+        z_col = None
+    else:
+        z = Z[np.ix_(S_idx, np.array([ui], dtype=np.intp))].reshape(-1)
+        v = solve_with_cholesky(Q, z)
+        alpha = float(Z[ui, ui] - np.dot(z, v))
+        alpha = max(alpha, 1e-12)
+        q_u = Z[:, ui] - Z[:, S_idx] @ v
+        z_col = z.astype(np.float64, copy=False)
+
+    gain = (float(np.dot(s, q_u)) ** 2) / alpha
+    if not np.isfinite(gain):
+        gain = 0.0
+    return gain, z_col, alpha
+
+
+
+def benefit_fixed_set(Z: np.ndarray, s: np.ndarray, S: Sequence[int], ridge: float = 1e-8) -> float:
+    """F(S) = s^T P_S s for a fixed set S."""
+    if len(S) == 0:
+        return 0.0
+    S_idx = np.asarray(S, dtype=np.intp)
+    ZSS = 0.5 * (Z[np.ix_(S_idx, S_idx)] + Z[np.ix_(S_idx, S_idx)].T)
+    ridge_eff = max(ridge, 1e-8 * len(S_idx))
+    ZSS = ZSS + ridge_eff * np.eye(len(S_idx))
+    try:
+        L = np.linalg.cholesky(ZSS)
+    except np.linalg.LinAlgError:
+        ZSS = project_psd(ZSS, eps=ridge_eff)
+        L = np.linalg.cholesky(ZSS)
+    v = Z[np.ix_(S_idx, np.arange(Z.shape[0]))] @ s
+    x = solve_with_cholesky(L, v)
+    return max(float(v @ x), 0.0)
+
+def benefit_on_ground_set_incremental(
+    Z: np.ndarray, s: np.ndarray, ground_set: Sequence[int]
+) -> float:
+    """
+    F(S) on the full ground set via incremental marginals (same as greedy additions).
+    Avoids an n x n Cholesky when |S| = n.
+    """
+    state = FastScenarioState(Z=Z, s=s)
+    for u in ground_set:
+        S_idx = np.asarray(state.S, dtype=np.intp)
+        mg, z_col, _ = marginal_gain_for_node(Z, state.Q, s, S_idx, int(u))
+        if mg <= 0:
+            continue
+        state.benefit += mg
+        state.add_node(int(u), z_col)
+    return state.benefit
+
+
 def compute_delta_with_factor(Z, Q, s, S, ridge=1e-8, normalize: bool = False):
     n = Z.shape[0]
     # Preserve insertion order: Q matches Z_SS in this row/column order, not sorted(S).
@@ -147,6 +212,7 @@ def opinion_seeding_fast(
     remaining = list(range(n))
     objective_value = 0
     objective_prev = 0
+    Q = None
 
     start_time = time.time()
 
@@ -160,35 +226,14 @@ def opinion_seeding_fast(
 
         for u in remaining:
             ui = int(u)
-            if len(S) == 0:
-                # No solve needed yet
-                alpha = float(Z[ui, ui])
-                q_u = Z[:, ui]
-            else:
-                Su = np.ix_(S_idx, np.array([ui], dtype=np.intp))
-                z = Z[Su].reshape(-1)  # Z_{S,u}
-                v = solve_with_cholesky(Q, z)  # Z_SS^{-1} Z_{S,u}
-                alpha = float(Z[ui, ui] - np.dot(z, v))
-                alpha = max(alpha, 1e-12)
-
-                # q_S = Z_{:,u} - Z_{:,S} Z_SS^{-1} Z_{S,u}
-                q_u = Z[:, ui] - Z[:, S_idx] @ v
-
-            if alpha <= 1e-12:
+            gain, z_col, alpha = marginal_gain_for_node(Z, Q, s, S_idx, ui)
+            if alpha <= 1e-12 or gain <= 1e-9:
                 continue
 
-            gain = (np.dot(s, q_u) ** 2) / alpha
-
-            if np.isfinite(gain) and gain > best_gain:
+            if gain > best_gain:
                 best_gain = gain
                 best_u = ui
-                best_z = (
-                    None
-                    if len(S) == 0
-                    else Z[np.ix_(S_idx, np.array([ui], dtype=np.intp))]
-                    .reshape(-1)
-                    .astype(np.float64, copy=False)
-                )
+                best_z = z_col
                 best_alpha = alpha
 
         if best_u is None or best_gain <= 1e-9:
@@ -241,196 +286,6 @@ def opinion_seeding_fast(
 
     return df, delta_final, delta_final_S, eta_time
 
-@dataclass
-class ScenarioOracle:
-    """
-    Fast oracle for one scenario:
-        F(S) = s^T P_S s,   P_S = Z_:S Z_SS^{-1} Z_S:
-    and
-        delta_S^* = - Z_SS^{-1} Z_Sbar s_bar.
-    """
-    Z: np.ndarray
-    s: np.ndarray
-    ridge: float = 1e-8
-
-    def __post_init__(self):
-        self.Z = project_psd(self.Z, eps=self.ridge)
-        self.s = np.asarray(self.s, dtype=float).reshape(-1)
-        ns = np.linalg.norm(self.s)
-        if ns == 0:
-            raise ValueError("s must be nonzero.")
-        self.s = self.s / ns
-
-        self._benefit_cache = {}
-        self._delta_cache = {}
-
-    def _factor(self, S):
-        idx = np.asarray(tuple(sorted(S)), dtype=np.intp)
-        ZSS = self.Z[np.ix_(idx, idx)]
-        ZSS = 0.5 * (ZSS + ZSS.T) + self.ridge * np.eye(len(idx))
-        return idx, cho_factor(ZSS, lower=True, check_finite=False)
-
-    def benefit(self, S) -> float:
-        """
-        Exact fixed-set benefit F(S), computed stably.
-        """
-        key = tuple(sorted(S))
-        if key in self._benefit_cache:
-            return self._benefit_cache[key]
-
-        if len(key) == 0:
-            self._benefit_cache[key] = 0.0
-            return 0.0
-
-        idx, cfac = self._factor(key)
-        # v = Z_{S,:} s
-        v = self.Z[np.ix_(idx, np.arange(self.Z.shape[0]))] @ self.s
-        x = cho_solve(cfac, v, check_finite=False)
-        val = float(v @ x)
-        val = max(val, 0.0)
-        self._benefit_cache[key] = val
-        return val
-
-    def delta(self, S):
-        """
-        Optimal fixed-set intervention delta_S^* padded to length n.
-        """
-        key = tuple(sorted(S))
-        if key in self._delta_cache:
-            return self._delta_cache[key]
-
-        n = self.Z.shape[0]
-        delta = np.zeros(n, dtype=float)
-
-        if len(key) == 0:
-            self._delta_cache[key] = (delta, np.array([], dtype=float))
-            return delta, np.array([], dtype=float)
-
-        idx, cfac = self._factor(key)
-        bar = np.setdiff1d(np.arange(n), idx, assume_unique=False)
-
-        # delta_S^* = -Z_SS^{-1} Z_Sbar s_bar
-        rhs = self.Z[np.ix_(idx, bar)] @ self.s[bar]
-        delta_S = -cho_solve(cfac, rhs, check_finite=False)
-
-        delta[idx] = delta_S
-        self._delta_cache[key] = (delta, delta_S)
-        return delta, delta_S
-
-
-def saturate_fast_helper(oracles: List[ScenarioOracle], ground_set: List[int], tol: float = 1e-6, max_outer: int = 50) -> Tuple[list[int], float]:
-    """
-    Saturate over a finite set of scenarios, using fast benefit oracles.
-
-    Returns
-    -------
-    best_S : set[int]
-        Seed set for the discretized robust problem.
-    best_c : float
-        Largest feasible threshold found.
-    """
-    ground_set = list(ground_set)
-    m = len(oracles)
-
-    def truncated_sum(S, c):
-        return sum(min(oracle.benefit(S), c) for oracle in oracles)
-
-    def greedy_cover(c):
-        """
-        Approximately solve the submodular covering subproblem:
-            find S such that sum_l min(F_l(S), c) >= m * c
-        """
-        S = set()
-        current = truncated_sum(S, c)
-
-        while current < m * c - tol:
-            best_u = None
-            best_gain = -np.inf
-
-            for u in ground_set:
-                if u in S:
-                    continue
-                cand = S | {u}
-                gain = truncated_sum(cand, c) - current
-                if gain > best_gain:
-                    best_gain = gain
-                    best_u = u
-
-            if best_u is None or best_gain <= tol:
-                return S, False
-
-            S.add(best_u)
-            current += best_gain
-
-        return S, True
-
-    # Safe upper bound: worst-case value on the full set
-    full_S = set(ground_set)
-    hi = min(oracle.benefit(full_S) for oracle in oracles)
-    lo = 0.0
-
-    best_S = set()
-    best_c = 0.0
-
-    for _ in range(max_outer):
-        c = 0.5 * (lo + hi)
-        S_c, feasible = greedy_cover(c)
-
-        if feasible:
-            lo = c
-            best_S = S_c
-            best_c = c
-        else:
-            hi = c
-
-        if hi - lo <= tol:
-            break
-
-    return best_S, best_c
-
-def robust_opinion_seeding(
-    G: nx.Graph, 
-    s: np.ndarray, 
-    C_bar: np.ndarray, 
-    rho: float, 
-    name: str, 
-    b: int = 100, 
-    seed: int = 0
-) -> pd.DataFrame:
-    L = sparse_laplacian(G)
-    L0 = L.copy().toarray()
-
-    n = len(G)
-    start_time = time.time()
-    eps = 0.1
-    q = max(int(np.log(n) / eps**2), 1)
-    
-    L_plus_I = L + sp.identity(n, format="csr")
-    U, R, X, M = sketch_solve(L_plus_I, q, seed)
-    
-    Cs = [C_bar, C_bar + 0.1 * np.eye(n), C_bar - 0.1 * np.eye(n)]
-
-    scenario_oracles = []
-    for C_l in Cs:   # list of discrete scenarios C^(1), ..., C^(m)
-        Z_l = M * C_l
-        scenario_oracles.append(ScenarioOracle(Z_l, s, ridge=1e-8))
-
-    # Run Saturate on the scenario family
-    S_sat, c_star = saturate_fast_helper(scenario_oracles, ground_set=range(len(s)), tol=1e-6)
-
-    # Compute the final interventions for each scenario if needed
-    deltas = []
-    delta_S_list = []
-    for oracle in scenario_oracles:
-        delta, delta_S = oracle.delta(S_sat)
-        deltas.append(delta)
-        delta_S_list.append(delta_S)
-        
-    eta_time = time.time() - start_time
-
-
-    return deltas, delta_S_list, S_sat, c_star
-
 def experiment_1_opinion_seeding_oracle(args: argparse.Namespace) -> None:
     out_dir = args.out_dir
 
@@ -438,6 +293,7 @@ def experiment_1_opinion_seeding_oracle(args: argparse.Namespace) -> None:
    
     if args.cached_results:
         concat_df = pd.read_csv(f'{out_dir}/experiment_1_opinion_seeding_oracle.csv')
+        df_delta = pd.read_csv(f'{out_dir}/experiment_1_opinion_seeding_oracle_delta.csv')
     else:
         concat_df = []
         df_delta = []
@@ -506,6 +362,7 @@ def experiment_2_robust_opinion_seeding_oracle(args: argparse.Namespace) -> None
 
     if args.cached_results:
         concat_df = pd.read_csv(f'{out_dir}/experiment_2_robust_opinion_seeding_oracle.csv')
+        df_delta = pd.read_csv(f'{out_dir}/experiment_2_robust_opinion_seeding_oracle_delta.csv')
     else:
         concat_df = []
         df_delta = []
@@ -516,8 +373,12 @@ def experiment_2_robust_opinion_seeding_oracle(args: argparse.Namespace) -> None
                 
                 df, delta_final, delta_final_S, eta_time = robust_opinion_seeding(G, s, C_bar, args.rho, name, args.b, args.seed)
 
-                delta_final = delta_final / np.linalg.norm(delta_final)
-                delta_final_S = delta_final_S / np.linalg.norm(delta_final_S)
+                delta_final = np.asarray(delta_final, dtype=float).reshape(-1)
+                delta_final_S = np.asarray(delta_final_S, dtype=float).reshape(-1)
+                norm = np.linalg.norm(delta_final_S)
+                if norm > 0:
+                    delta_final = delta_final / norm
+                    delta_final_S = delta_final_S / norm
 
                 df['Name'] = name
                 df['Nominal Partition Type'] = group_type
@@ -528,15 +389,15 @@ def experiment_2_robust_opinion_seeding_oracle(args: argparse.Namespace) -> None
                 df['Time (s)'] = eta_time
                 df['Per Step Time (s)'] = eta_time / args.b
 
-                delta_final_sorted = -np.sort(-delta_final_S)
-                
-                for rank, delta in enumerate(delta_final_sorted):
-                    df_delta.append({
-                        'Name': name,
-                        'Nominal Partition Type': group_type,
-                        'Delta': delta,
-                        'Rank': rank + 1,
-                    })
+                if delta_final_S.size > 0:
+                    delta_final_sorted = -np.sort(-delta_final_S)
+                    for rank, delta in enumerate(delta_final_sorted):
+                        df_delta.append({
+                            'Name': name,
+                            'Nominal Partition Type': group_type,
+                            'Delta': delta,
+                            'Rank': rank + 1,
+                        })
 
                 concat_df.append(df)
 
