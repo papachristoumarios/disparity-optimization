@@ -374,36 +374,49 @@ def sketch_solve_helper(A: Union[sp.csr_matrix, np.ndarray], R: np.ndarray) -> n
 
 def sketch_U_sherman_morrison_two_rank(
     U: np.ndarray,
+    R: np.ndarray,
     q: int,
     w: float,
     a: np.ndarray,
     c: np.ndarray,
     denom_eps: float = 1e-14,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if w == 0.0:
-        return U
     u_vec = np.sqrt(w) * np.asarray(a, dtype=np.float64).ravel()
     z_vec = np.sqrt(w) * np.asarray(c, dtype=np.float64).ravel()
 
+    # --- Step 1: First Rank-1 Update (Adding u_vec) ---
+    # Approximate X @ u_vec using (U @ R.T @ u) / q
+    Xu = (U @ (R.T @ u_vec)) / q
     t_u = U.T @ u_vec
-    Xu = (U @ t_u) / q
-    d = float(u_vec @ Xu)
-    denom1 = 1.0 + d
+
+    denom1 = 1.0 + float(u_vec @ Xu)
     if abs(denom1) < denom_eps:
-        denom1 = math.copysign(denom_eps, denom1) if denom1 != 0.0 else denom_eps
+        denom1 = (
+            math.copysign(denom_eps, denom1) if denom1 != 0.0 else denom_eps
+        )
 
-    t_z = U.T @ z_vec
-    Xz = (U @ t_z) / q
-    X1_z = Xz - Xu * float(Xu @ z_vec) / denom1
-
+    # Compute intermediate U1 after the first rank-1 update
     U1 = U - np.outer(Xu, t_u) / denom1
 
-    d2 = 1.0 - float(z_vec @ X1_z)
-    if abs(d2) < denom_eps:
-        d2 = math.copysign(denom_eps, d2) if d2 != 0.0 else denom_eps
+    # --- Step 2: Second Rank-1 Update (Subtracting z_vec) ---
+    # Approximate X @ z_vec on the original matrix
+    Xz = (U @ (R.T @ z_vec)) / q
 
+    # Apply Sherman-Morrison to find X1_z (the action of intermediate X1 on z_vec)
+    X1_z = Xz - Xu * float(u_vec @ Xz) / denom1
+
+    denom2 = 1.0 - float(z_vec @ X1_z)
+    if abs(denom2) < denom_eps:
+        denom2 = (
+            math.copysign(denom_eps, denom2) if denom2 != 0.0 else denom_eps
+        )
+
+    # Compute final updated U matrix
     g = U1.T @ z_vec
-    return U1 + np.outer(X1_z, g) / d2
+    U = U1 + np.outer(X1_z, g) / denom2
+    X = (U @ R.T) / q
+    M = (U @ U.T) / q
+    return U, R, X, M
 
 
 def cholesky_add_node(L, z, z_uu, jitter=1e-12):

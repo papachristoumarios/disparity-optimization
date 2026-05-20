@@ -126,6 +126,7 @@ def parse_args():
     parser.add_argument('--s_type', default='actual', choices=['actual', 'adversarial'])
     parser.add_argument('--embedding_type', default='precomputed', choices=['node2vec', 'gaussian', 'network_structure', 'precomputed'])
     parser.add_argument('--cached_results', action='store_true')
+    parser.add_argument('--betweenness_refresh', default=100, type=int)
     return parser.parse_args()
 
 
@@ -179,7 +180,7 @@ def robust_link_recommendation(G: nx.Graph, Cbar: np.ndarray, rho: float, name: 
     records_outer.append(
         {
             "Name": name,
-            "Metric": "C deviation Frobenius",
+            "Metric": "Frobenius deviation",
             "Percent Change": 0.0,
             "Value": 0.0,
             "k": 0,
@@ -190,7 +191,7 @@ def robust_link_recommendation(G: nx.Graph, Cbar: np.ndarray, rho: float, name: 
     records_outer.append(
         {
             "Name": name,
-            "Metric": "C deviation spectral",
+            "Metric": "Spectral deviation",
             "Percent Change": 0.0,
             "Value": 0.0,
             "k": 0,
@@ -264,7 +265,7 @@ def robust_link_recommendation(G: nx.Graph, Cbar: np.ndarray, rho: float, name: 
         records_outer.append(
             {
                 "Name": name,
-                "Metric": "C deviation Frobenius",
+                "Metric": "Frobenius deviation",
                 "Percent Change": float(100.0 * dev_fro / (cbar_fro + 1e-14)),
                 "Value": dev_fro,
                 "k": k + 1,
@@ -275,7 +276,7 @@ def robust_link_recommendation(G: nx.Graph, Cbar: np.ndarray, rho: float, name: 
         records_outer.append(
             {
                 "Name": name,
-                "Metric": "C deviation spectral",
+                "Metric": "Spectral deviation",
                 "Percent Change": float(100.0 * dev_spec / (cbar_spec + 1e-14)),
                 "Value": dev_spec,
                 "k": k + 1,
@@ -327,16 +328,20 @@ def link_recommendation(
 
     progress_bar = tqdm(total=T_L, desc="Link Recommendations")
 
+
     if s is not None:
         initial_disparity = s.T @ (M * C) @ s
         initial_polarization = s.T @ M @ s
         initial_surrogate_disparity = s.T @ (X * C) @ s
         s_type = 'actual'
     else:
-        initial_disparity, s = top_eigenpair(M * C)
-        initial_polarization, s = top_eigenpair(M)
-        initial_surrogate_disparity, s = top_eigenpair(X * C)
+        initial_disparity, _ = top_eigenpair(M * C)
+        initial_polarization, _ = top_eigenpair(M)
+        initial_surrogate_disparity, _ = top_eigenpair(X * C)
         s_type = 'adversarial'
+
+    # import pdb; pdb.set_trace()
+
 
     initial_L0_fro = np.linalg.norm(L0, 'fro')
 
@@ -373,7 +378,7 @@ def link_recommendation(
         u_plus, v_plus = edge_plus
         u_minus, v_minus = edge_minus
 
-        eta_current = eta / np.sqrt(i + 1)
+        eta_current = eta
         weight_change = max(0.0, min(eta_current, H[u_plus][v_plus]['weight'], H[u_minus][v_minus]['weight']))
 
         if Cbar_for_groups is not None:
@@ -406,11 +411,12 @@ def link_recommendation(
         if (i + 1) % T_refresh == 0:
             L_plus_I = L + sp.identity(n, format="csr")
             U, R, X, M = sketch_solve(L_plus_I, q, seed)
+        else:
+            U, R, X, M = sketch_U_sherman_morrison_two_rank(
+                U, R, q, weight_change, b_uv_plus.ravel(), b_uv_minus.ravel()
+            )
+
         
-
-        M = (U @ U.T) / q
-        X = (U @ R.T) / q
-
         Z_tilde = X * C
         Z = M * C
 
@@ -419,11 +425,11 @@ def link_recommendation(
             disparity = s.T @ Z @ s
             polarization = s.T @ M @ s
         else:
-            surrogate_disparity, s = top_eigenpair(Z_tilde)
-            disparity, s = top_eigenpair(Z)
-            polarization, s = top_eigenpair(M)
-        
+            surrogate_disparity, _ = top_eigenpair(Z_tilde)
+            disparity, _ = top_eigenpair(Z)
+            polarization, _ = top_eigenpair(M)
 
+        # if convergence is detected, break
         if np.isclose(surrogate_disparity, surrogate_disparity_prev, rtol=1e-6):
             break
         
@@ -610,6 +616,10 @@ def fiedler_maximizing_link_recommendation(
             L_plus_I = L + sp.identity(n, format="csr")
             U, R, X, M = sketch_solve(L_plus_I, q, seed)
         
+        else:
+            U, R, X, M = sketch_U_sherman_morrison_two_rank(
+                U, R, q, weight_change, b_uv_plus.ravel(), b_uv_minus.ravel()
+            )
 
         Z_tilde = X * C
         Z = M * C
@@ -659,17 +669,8 @@ def fiedler_maximizing_link_recommendation(
                 * 100,
             }
         )
-        # records.append(
-        #     {
-        #         "Step": i,
-        #         "Metric": f"$\\|L_{{t}} - L_{{0}}\\|_F$ / $\\|L_{{0}}\\|_F$",
-        #         "Percent Change": diff_L_fro,
-        #     }
-        # )
-
-        progress_bar.set_description(
-            f"Name: {name}, λ2: {lam2_new:.4g}, S: {surrogate_disparity:.2g}, D: {disparity:.2g}, P: {polarization:.2g}"
-        )
+        
+        progress_bar.set_description(f"Name: {name}")
         progress_bar.update(1)
         progress_bar.refresh()
 
@@ -931,6 +932,10 @@ def generalized_link_reweighting(
         if (i + 1) % T_refresh == 0:
             L_plus_I = L + sp.identity(n, format="csr")
             U, R, X, M = sketch_solve(L_plus_I, q, seed)
+        else:
+            U, R, X, M = sketch_U_sherman_morrison_two_rank(
+                U, R, q, weight_change, b_uv_plus.ravel(), b_uv_minus.ravel()
+            )
         
 
         Z_tilde = X * C
@@ -1041,7 +1046,7 @@ def generalized_link_reweighting(
         )
 
         progress_bar.set_description(
-            f"{desc} | {name} S:{surrogate_disparity:.2g} D:{disparity:.2g} P:{polarization:.2g}"
+            f"Name: {name}"
         )
         progress_bar.update(1)
         progress_bar.refresh()
@@ -1128,7 +1133,7 @@ def robust_link_recommendation_baseline(
     records_outer.append(
         {
             "Name": name,
-            "Metric": "C deviation Frobenius",
+            "Metric": "Frobenius deviation",
             "Percent Change": 0.0,
             "Value": 0.0,
             "k": 0,
@@ -1140,7 +1145,7 @@ def robust_link_recommendation_baseline(
     records_outer.append(
         {
             "Name": name,
-            "Metric": "C deviation spectral",
+            "Metric": "Spectral deviation",
             "Percent Change": 0.0,
             "Value": 0.0,
             "k": 0,
@@ -1239,7 +1244,7 @@ def robust_link_recommendation_baseline(
         records_outer.append(
             {
                 "Name": name,
-                "Metric": "C deviation Frobenius",
+                "Metric": "Frobenius deviation",
                 "Percent Change": float(100.0 * dev_fro / (cbar_fro + 1e-14)),
                 "Value": dev_fro,
                 "k": k + 1,
@@ -1251,7 +1256,7 @@ def robust_link_recommendation_baseline(
         records_outer.append(
             {
                 "Name": name,
-                "Metric": "C deviation spectral",
+                "Metric": "Spectral deviation",
                 "Percent Change": float(100.0 * dev_spec / (cbar_spec + 1e-14)),
                 "Value": dev_spec,
                 "k": k + 1,
@@ -1298,8 +1303,8 @@ _EXPERIMENT_4_AUX_INNER_METRICS_ORDER = (
 
 _EXPERIMENT_4_OUTER_C_DEV_METRICS = frozenset(
     {
-        "C deviation Frobenius",
-        "C deviation spectral",
+        "Frobenius deviation",
+        "Spectral deviation",
     }
 )
 
@@ -1398,19 +1403,11 @@ def experiment_1_link_recommendation_oracle(args: argparse.Namespace):
     # sort concat_df by Number of Nodes
     concat_df = concat_df.sort_values(by='Number of Nodes')
 
-    sns.lineplot(x='Number of Nodes', y='Time (s)', data=concat_df, ax=ax_a[0, -1], markers=True, marker='x', markersize=5)
+    sns.barplot(x='Name', y='Time (s)', data=concat_df, ax=ax_a[0, -1], legend=True, dodge=True)
 
-    alpha = 0.05
-
-    min_number_of_nodes = int((1 - alpha) * concat_df['Number of Nodes'].min())
-    max_number_of_nodes = int((1 + alpha) * concat_df['Number of Nodes'].max())
-
-    n_range = np.arange(min_number_of_nodes, max_number_of_nodes, 50)
-    ax_a[0, -1].set_title('Runtime of Link Recommendation Oracle')
+    ax_a[0, -1].set_title('Runtime')
     ax_a[0, -1].set_xlabel('Number of Nodes')
-    ax_a[0, -1].set_ylabel('Runtime (s)')
-    ax_a[0, -1].set_xlim(min_number_of_nodes, max_number_of_nodes)
-
+    ax_a[0, -1].set_ylabel('Time (s)')
     ax_a[0, -1].set_yscale('log')
 
     fig_a.suptitle('Link Recommendation Oracle (Step 1)')
@@ -1526,7 +1523,7 @@ def experiment_3_worst_case_C_oracle(args: argparse.Namespace):
                 T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
                 L = sparse_laplacian(G)
                 L_plus_I = L + sp.identity(L.shape[0], format="csr")
-                U, R, X, M = sketch_solve(L_plus_I, q, seed)
+                U, R, X, M = sketch_solve(L_plus_I, q, seed=args.seed)
 
                 for rho in rho_values:
                     print(f'Classifier error rho = {rho}')
@@ -1594,19 +1591,29 @@ def experiment_3_worst_case_C_oracle(args: argparse.Namespace):
 
     fig_a, ax_a = plt.subplots(nrows=1, ncols=(1 + num_names), figsize=(FIGSIZE * (1 + num_names), FIGSIZE), squeeze=False)
 
+    min_y_lim = np.inf
+    max_y_lim = 0
+
     for i, name in enumerate(concat_df['Name'].unique()):
         df_name = concat_df[(concat_df['Name'] == name) & (concat_df['Metric'].isin(['Disparity', 'Surrogate']))].copy()
         sns.lineplot(x='Rho', y='Value', hue='Metric', style='Nominal Partition Type', markers=True, marker='x', markersize=5, data=df_name, ax=ax_a[0, i], legend=(i == num_names - 1))
         ax_a[0, i].set_title(name)
         ax_a[0, i].set_xlabel('$\\rho$')
         ax_a[0, i].set_ylabel('Percent Change')
-        ax_a[0, i].set_ylim(0, 120)
+
+        min_y_lim = min(min_y_lim, df_name['Value'].min())
+        max_y_lim = max(max_y_lim, df_name['Value'].max())
+
+    for i in range(num_names):
+        ax_a[0, i].set_ylim(min_y_lim, max_y_lim)
+
 
     df_time = concat_df[concat_df['Metric'].isin(['Time (s)'])].copy()
-    sns.scatterplot(x='Number of Nodes', y='Value', hue='Rho', data=df_time, ax=ax_a[0, -1], legend=False, markersize=15)
-    ax_a[0, -1].set_title('Time')
-    ax_a[0, -1].set_xlabel('Number of Nodes')
+    sns.barplot(x='Name', y='Value', hue='Rho', data=df_time, ax=ax_a[0, -1], legend=True, dodge=True)
+    ax_a[0, -1].set_title('Runtime')
+    ax_a[0, -1].set_xlabel('')
     ax_a[0, -1].set_ylabel('Time (s)')
+    ax_a[0, -1].set_yscale('log')
 
     fig_a.suptitle(f'Correlation matrix update oracle (Step 2)')
     fig_a.tight_layout()
@@ -1634,7 +1641,7 @@ def experiment_4_robust_link_recommendation_oracle(args: argparse.Namespace):
                 G, s, Cbar = load_dataset(name, group_type)
                 T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
 
-                # K = 3
+                K = 3
 
                 for rho in rho_values:
                     print(f'Classifier error rho = {rho}')
@@ -1721,15 +1728,10 @@ def experiment_4_robust_link_recommendation_oracle(args: argparse.Namespace):
 
     plot_df_sorted = plot_df.sort_values(by='Number of Nodes')
     df_rt = plot_df_sorted.drop_duplicates(subset=['Name', 'Rho'], keep='first')
-    sns.scatterplot(x='Number of Nodes', y='Time (s)', hue='Rho', style='Name', data=df_rt, ax=ax_a[0, -1], legend=True)
-    ax_a[0, -1].set_title('Runtime of Robust Link Recommendation Oracle')
-    ax_a[0, -1].set_xlabel('Number of Nodes')
-    ax_a[0, -1].set_ylabel('Runtime (s)')
-
-    alpha_n = 0.05
-    min_number_of_nodes = int((1 - alpha_n) * plot_df_sorted['Number of Nodes'].min())
-    max_number_of_nodes = int((1 + alpha_n) * plot_df_sorted['Number of Nodes'].max())
-    ax_a[0, -1].set_xlim(min_number_of_nodes, max_number_of_nodes)
+    sns.barplot(x='Name', y='Time (s)', hue='Rho', data=df_rt, ax=ax_a[0, -1], legend=True, dodge=True)
+    ax_a[0, -1].set_title('Runtime')
+    ax_a[0, -1].set_xlabel('')
+    ax_a[0, -1].set_ylabel('Time (s)')
     ax_a[0, -1].set_yscale('log')
 
     fig_a.suptitle('Robust Link Recommendation Oracle')
@@ -1791,7 +1793,7 @@ def experiment_4_robust_link_recommendation_oracle(args: argparse.Namespace):
     if not df_c_dev.empty:
         idx_max_k = df_c_dev.groupby(["Name", "Rho", "Metric"])["k"].transform("max")
         df_c_bar = df_c_dev[df_c_dev["k"] == idx_max_k].copy()
-        metric_order = ["C deviation Frobenius", "C deviation spectral"]
+        metric_order = ["Frobenius deviation", "Spectral deviation"]
         name_list = list(plot_df["Name"].unique())
         fig_e, ax_e = plt.subplots(
             nrows=1,

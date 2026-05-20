@@ -62,6 +62,7 @@ def parse_args():
     parser.add_argument('--s_type', default='actual', choices=['actual', 'adversarial'])
     parser.add_argument('--embedding_type', default='precomputed', choices=['node2vec', 'gaussian', 'network_structure', 'precomputed'])
     parser.add_argument('--cached_results', action='store_true')
+    parser.add_argument('--b', type=int, default=100)
     return parser.parse_args()
 
 def cholesky_add_node(L, z, z_uu, jitter=1e-12):
@@ -142,9 +143,12 @@ def opinion_seeding_fast(
 
     records = []
 
-    S = set()
-    remaining = set(range(n))
+    S = []
+    remaining = list(range(n))
     objective_value = 0
+    objective_prev = 0
+
+    start_time = time.time()
 
     for i in range(b):
         best_u = None
@@ -205,25 +209,37 @@ def opinion_seeding_fast(
         else:
             Q, _ = cholesky_add_node(Q, best_z, Z[bu, bu])
 
-        S.append(bu)
+        S.append(int(bu))
         remaining.remove(bu)
         objective_value += best_gain
         delta, delta_S = compute_delta_with_factor(Z, Q, s, S)
 
+        if i == 0:
+            initial_objective_value = objective_value
+
         records.append({
             'Step': i,
-            'Metric': 'Objective Value',
-            'Value': objective_value,
+            'Percent Change': (objective_value - initial_objective_value) / (1e-14 + initial_objective_value) * 100,
             'S': list(S),
             'Delta': delta,
             'Delta_S': delta_S,
         })
 
-        print(f"Step {i}: Objective Value: {objective_value}, S: {S}")
+        if np.isclose(objective_value, objective_prev, rtol=1e-6):
+            break
+
+        objective_prev = objective_value
+
+    eta_time = time.time() - start_time
 
     df = pd.DataFrame(records)
 
-    return df
+    final_step = df['Step'].max()
+
+    delta_final = df[df['Step'] == final_step]['Delta'].values[0]
+    delta_final_S = df[df['Step'] == final_step]['Delta_S'].values[0]
+
+    return df, delta_final, delta_final_S, eta_time
 
 @dataclass
 class ScenarioOracle:
@@ -385,13 +401,14 @@ def robust_opinion_seeding(
     L0 = L.copy().toarray()
 
     n = len(G)
+    start_time = time.time()
     eps = 0.1
     q = max(int(np.log(n) / eps**2), 1)
     
     L_plus_I = L + sp.identity(n, format="csr")
     U, R, X, M = sketch_solve(L_plus_I, q, seed)
     
-    Cs = generate_scenarios(C_bar, rho)
+    Cs = [C_bar, C_bar + 0.1 * np.eye(n), C_bar - 0.1 * np.eye(n)]
 
     scenario_oracles = []
     for C_l in Cs:   # list of discrete scenarios C^(1), ..., C^(m)
@@ -409,7 +426,8 @@ def robust_opinion_seeding(
         deltas.append(delta)
         delta_S_list.append(delta_S)
         
-    print(deltas, delta_S_list, S_sat, c_star)
+    eta_time = time.time() - start_time
+
 
     return deltas, delta_S_list, S_sat, c_star
 
@@ -422,22 +440,143 @@ def experiment_1_opinion_seeding_oracle(args: argparse.Namespace) -> None:
         concat_df = pd.read_csv(f'{out_dir}/experiment_1_opinion_seeding_oracle.csv')
     else:
         concat_df = []
+        df_delta = []
         for name, group_types in datasets:
             for group_type in group_types:
                 print(f"Running {name} with {group_type}")
                 G, s, C_bar = load_dataset(name, group_type)
                
-                import pdb; pdb.set_trace()
-                opinion_seeding_fast(G, s, C_bar, name, args.b, args.seed)
+                df, delta_final, delta_final_S, eta_time = opinion_seeding_fast(G, s, C_bar, name, args.b, args.seed)
 
+                delta_final = delta_final / np.linalg.norm(delta_final)
+                delta_final_S = delta_final_S / np.linalg.norm(delta_final_S)
+
+                df['Name'] = name
+                df['Nominal Partition Type'] = group_type
+                df['Number of Nodes'] = G.number_of_nodes()
+                df['Batch Size'] = args.batch_size
+                df['Learning Rate'] = args.eta
+                df['Seed'] = args.seed
+                df['Time (s)'] = eta_time
+                df['Per Step Time (s)'] = eta_time / args.b
+
+                delta_final_sorted = -np.sort(-delta_final_S)
+                
+                for rank, delta in enumerate(delta_final_sorted):
+                    df_delta.append({
+                        'Name': name,
+                        'Nominal Partition Type': group_type,
+                        'Delta': delta,
+                        'Rank': rank + 1,
+                    })
+
+                concat_df.append(df)
 
         concat_df = pd.concat(concat_df, ignore_index=True)
         concat_df.to_csv(f'{out_dir}/experiment_1_opinion_seeding_oracle.csv', index=False)
 
+        df_delta = pd.DataFrame(df_delta)
+        df_delta.to_csv(f'{out_dir}/experiment_1_opinion_seeding_oracle_delta.csv', index=False)
+
+    # plot percent change in benefit
+    num_names = concat_df['Name'].nunique()
+    fig_a, ax_a = plt.subplots(nrows=1, ncols=3, figsize=(FIGSIZE * 3, FIGSIZE), squeeze=False)
+
+    sns.lineplot(x='Step', y='Percent Change', hue='Name', style='Nominal Partition Type', data=concat_df, ax=ax_a[0, 0], markers=True, marker='x', markersize=5)
+
+    sns.lineplot(x='Rank', y='Delta', hue='Name', style='Nominal Partition Type', data=df_delta, ax=ax_a[0, 1], markers=True, marker='x', markersize=5)
+    ax_a[0, 1].set_xlabel('Rank')
+    ax_a[0, 1].set_ylabel('Normalized Intervention $\\delta_S / ||\\delta_S||$')
+
+    sns.barplot(x='Name', y='Time (s)', data=concat_df, ax=ax_a[0, 2])
+    ax_a[0, 2].set_title('Runtime')
+    ax_a[0, 2].set_xlabel('')
+    ax_a[0, 2].set_ylabel('Time (s)')
+    ax_a[0, 2].set_yscale('log')
+
+    fig_a.suptitle('Opinion Seeding Oracle')
+
+    fig_a.tight_layout()
+    fig_a.savefig(f'{out_dir}/experiment_1_opinion_seeding_oracle.pdf', dpi=300, bbox_inches='tight')
+
+def experiment_2_robust_opinion_seeding_oracle(args: argparse.Namespace) -> None:
+    out_dir = args.out_dir
+
+    datasets = get_datasets(args)
+
+    if args.cached_results:
+        concat_df = pd.read_csv(f'{out_dir}/experiment_2_robust_opinion_seeding_oracle.csv')
+    else:
+        concat_df = []
+        df_delta = []
+        for name, group_types in datasets:
+            for group_type in group_types:
+                print(f"Running {name} with {group_type}")
+                G, s, C_bar = load_dataset(name, group_type)
+                
+                df, delta_final, delta_final_S, eta_time = robust_opinion_seeding(G, s, C_bar, args.rho, name, args.b, args.seed)
+
+                delta_final = delta_final / np.linalg.norm(delta_final)
+                delta_final_S = delta_final_S / np.linalg.norm(delta_final_S)
+
+                df['Name'] = name
+                df['Nominal Partition Type'] = group_type
+                df['Number of Nodes'] = G.number_of_nodes()
+                df['Batch Size'] = args.batch_size
+                df['Learning Rate'] = args.eta
+                df['Seed'] = args.seed
+                df['Time (s)'] = eta_time
+                df['Per Step Time (s)'] = eta_time / args.b
+
+                delta_final_sorted = -np.sort(-delta_final_S)
+                
+                for rank, delta in enumerate(delta_final_sorted):
+                    df_delta.append({
+                        'Name': name,
+                        'Nominal Partition Type': group_type,
+                        'Delta': delta,
+                        'Rank': rank + 1,
+                    })
+
+                concat_df.append(df)
+
+        concat_df = pd.concat(concat_df, ignore_index=True)
+        concat_df.to_csv(f'{out_dir}/experiment_2_robust_opinion_seeding_oracle.csv', index=False)
+
+        df_delta = pd.DataFrame(df_delta)
+        df_delta.to_csv(f'{out_dir}/experiment_2_robust_opinion_seeding_oracle_delta.csv', index=False)
+
+    # plot percent change in benefit
+    num_names = concat_df['Name'].nunique()
+    fig_a, ax_a = plt.subplots(nrows=1, ncols=3, figsize=(FIGSIZE * 3, FIGSIZE), squeeze=False)
+
+    sns.lineplot(x='Step', y='Percent Change', hue='Name', style='Nominal Partition Type', data=concat_df, ax=ax_a[0, 0], markers=True, marker='x', markersize=5)
+    ax_a[0, 0].set_title('Percent Change in Benefit')
+    ax_a[0, 0].set_xlabel('Step')
+    ax_a[0, 0].set_ylabel('Percent Change')
+
+    sns.lineplot(x='Rank', y='Delta', hue='Name', style='Nominal Partition Type', data=df_delta, ax=ax_a[0, 1], markers=True, marker='x', markersize=5)
+    ax_a[0, 1].set_title('Delta Final Sorted by Rank')
+    ax_a[0, 1].set_xlabel('Rank')
+    ax_a[0, 1].set_ylabel('Normalized Intervention $\\delta_S / ||\\delta_S||$')
+
+    sns.barplot(x='Name', y='Time (s)', data=concat_df, ax=ax_a[0, 2])
+    ax_a[0, 2].set_title('Runtime')
+    ax_a[0, 2].set_xlabel('')
+    ax_a[0, 2].set_ylabel('Time (s)')
+    ax_a[0, 2].set_yscale('log')
+
+    fig_a.suptitle('Robust Opinion Seeding Oracle')
+
+    fig_a.tight_layout()
+    fig_a.savefig(f'{out_dir}/experiment_2_robust_opinion_seeding_oracle.pdf', dpi=300, bbox_inches='tight')
+    concat_df.to_csv(f'{out_dir}/experiment_2_robust_opinion_seeding_oracle.csv', index=False)
+    df_delta.to_csv(f'{out_dir}/experiment_2_robust_opinion_seeding_oracle_delta.csv', index=False)
 
 def main(args: argparse.Namespace) -> None:
     experiment_dict = dict([
         (1, experiment_1_opinion_seeding_oracle),
+        (2, experiment_2_robust_opinion_seeding_oracle),
     ])
     
     experiment_list = set()
