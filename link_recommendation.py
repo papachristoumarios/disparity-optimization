@@ -42,7 +42,6 @@ sns.set_theme(
 FIGSIZE = 5.5
 
 
-
 def _pct_change_vs_ref(curr: float, ref: float) -> float:
     if not np.isfinite(curr):
         return 0.0
@@ -2348,9 +2347,8 @@ def experiment_8_robust_link_recommendation_baselines(args: argparse.Namespace) 
 
 def experiment_9_predictive_model(args: argparse.Namespace) -> None:
     out_dir = args.out_dir
-    # datasets = [('twitch-RU', ['label'])]
     datasets = get_datasets(args)   
-    train_data_fractions = np.array([0.05, 0.1])
+    train_data_fractions = np.array([0.1, 0.2, 0.3])
     train_val_split = 0.8
 
     if args.cached_results:
@@ -2370,6 +2368,7 @@ def experiment_9_predictive_model(args: argparse.Namespace) -> None:
                     embeddings = np.load(embeddings_filename)
                 elif args.embedding_type == 'node2vec':
                     print("training embeddings for ", name, group_type)
+                    from karateclub import Node2Vec
                     model = Node2Vec(dimensions=64, walk_length=30, workers=4)
                     model.fit(G)
                     embeddings = model.get_embedding()
@@ -2444,13 +2443,12 @@ def experiment_9_predictive_model(args: argparse.Namespace) -> None:
 
                     Cbar_pred = label_predictions @ label_predictions.T
 
-                    
                     print(f"Test Accuracy for {name} {group_type} {train_data_fraction}: {test_accuracy}")
 
                     rho = (1 - train_data_fraction) * (1 - accuracy)
                     T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
                     
-                    # K = 3
+                    K = 10
                     df_inner, df_outer, eta_time, _, _ = robust_link_recommendation(
                         G=G.copy(),
                         Cbar=Cbar_pred,
@@ -2549,7 +2547,7 @@ def experiment_9_predictive_model(args: argparse.Namespace) -> None:
         )
         ax_a[0, i].set_title(name)
         ax_a[0, i].set_xlabel("Fraction of training data")
-        ax_a[0, i].set_ylim(min_percent_change, max_percent_change)
+        # ax_a[0, i].set_ylim(min_percent_change, max_percent_change)
 
         df_time = plot_df[plot_df["Name"] == name].drop_duplicates(
             subset=["Fraction of Training Data"],

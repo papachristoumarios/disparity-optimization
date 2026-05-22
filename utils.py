@@ -610,14 +610,25 @@ class ScenarioOracle:
         return delta, delta_S
 
 
-def saturate_fast_helper(oracles: List[ScenarioOracle], ground_set: List[int], tol: float = 1e-6, max_outer: int = 50) -> Tuple[list[int], float]:
+def saturate_fast_helper(
+    oracles: List[ScenarioOracle],
+    ground_set: List[int],
+    tol: float = 1e-6,
+    max_outer: int = 50,
+    max_budget: Optional[int] = None,
+) -> Tuple[List[int], float]:
     """
     Saturate over a finite set of scenarios, using fast benefit oracles.
 
+    Solves the discretized robust submodular maximization problem
+        max_{|S| <= max_budget} min_l F_l(S)
+    by binary search on a threshold c and greedy coverage of
+        sum_l min(F_l(S), c) >= m * c.
+
     Returns
     -------
-    best_S : set[int]
-        Seed set for the discretized robust problem.
+    best_S : list[int]
+        Seed set in insertion order for the discretized robust problem.
     best_c : float
         Largest feasible threshold found.
     """
@@ -632,10 +643,14 @@ def saturate_fast_helper(oracles: List[ScenarioOracle], ground_set: List[int], t
         Approximately solve the submodular covering subproblem:
             find S such that sum_l min(F_l(S), c) >= m * c
         """
-        S = set()
+        S: set[int] = set()
+        S_order: List[int] = []
         current = truncated_sum(S, c)
 
         while current < m * c - tol:
+            if max_budget is not None and len(S) >= max_budget:
+                return S_order, False
+
             best_u = None
             best_gain = -np.inf
 
@@ -649,19 +664,20 @@ def saturate_fast_helper(oracles: List[ScenarioOracle], ground_set: List[int], t
                     best_u = u
 
             if best_u is None or best_gain <= tol:
-                return S, False
+                return S_order, False
 
             S.add(best_u)
+            S_order.append(best_u)
             current += best_gain
 
-        return S, True
+        return S_order, True
 
     # Safe upper bound: worst-case value on the full set
     full_S = set(ground_set)
     hi = min(oracle.benefit(full_S) for oracle in oracles)
     lo = 0.0
 
-    best_S = set()
+    best_S_order: List[int] = []
     best_c = 0.0
 
     for _ in range(max_outer):
@@ -670,7 +686,7 @@ def saturate_fast_helper(oracles: List[ScenarioOracle], ground_set: List[int], t
 
         if feasible:
             lo = c
-            best_S = S_c
+            best_S_order = S_c
             best_c = c
         else:
             hi = c
@@ -678,32 +694,25 @@ def saturate_fast_helper(oracles: List[ScenarioOracle], ground_set: List[int], t
         if hi - lo <= tol:
             break
 
-    return best_S, best_c
+    return best_S_order, best_c
 
-def generate_correlation_matrix_scenario(Cbar: np.ndarray, mode: str, **kwargs) -> np.ndarray:
-    if mode == 'classifier_error':
-        if 'p' in kwargs:
-            p = kwargs['p']
-        else:
-            raise ValueError("p must be provided")
-        n = Cbar.shape[0]
+def generate_scenarios(Cbar: np.ndarray, rho: float, num_scenarios: int = 3) -> List[np.ndarray]:
 
-        C = Cbar.copy()
-        for i in range(n):
-            for j in range(n):
-                if i != j:
-                    C[i, j] = (1 - 2*p)**2 * C[i, j]
-    elif mode == 'differential_privacy':
-        if 'epsilon' in kwargs:
-            epsilon = kwargs['epsilon']
-        else:
-            raise ValueError("epsilon must be provided")
-        p = 1 / (1 + np.exp(epsilon))
-        return generate_correlation_matrix_scenario(Cbar, mode='classifier_error', p=p)
-    else:
-        raise ValueError(f"Invalid mode: {mode}")
+    Cs = [Cbar]
+    
+    gamma = 4 * rho * (1 - rho)
 
-    return C
+    # generate random correlation matrix from the set {C : diag(C) = 1, C PSD, |C[i, j] - Cbar[i, j]| <= gamma}
+    rng = np.random.default_rng(0)
+    while len(Cs) < num_scenarios:
+        C = np.zeros_like(Cbar, dtype=float)
+        for j in range(C.shape[0]):
+            for k in range(C.shape[1]):
+                if j != k:
+                    C[j, k] = Cbar[j, k] + rng.uniform(-gamma, gamma)
+        Cs.append(project_psd(C))
+
+    return Cs
 
 
 def sketch_solve(A, q=None, seed=None):
