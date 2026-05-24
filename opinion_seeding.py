@@ -103,6 +103,7 @@ def marginal_gain_for_node(
     s: np.ndarray,
     S_idx: np.ndarray,
     u: int,
+    nu: float = 1.0,
 ) -> Tuple[float, Optional[np.ndarray], float]:
     """
     Marginal benefit of adding u to S for F(S) = s^T P_S s:
@@ -227,6 +228,7 @@ def opinion_seeding_fast(
     b: int = 100, 
     seed: int = 0,
     selection: str = "greedy",
+    nu: float = 1.0,
 ) -> pd.DataFrame:
     if selection not in OPINION_SEEDING_METHOD_LABELS:
         raise ValueError(f"selection must be one of {list(OPINION_SEEDING_METHOD_LABELS)}")
@@ -267,7 +269,7 @@ def opinion_seeding_fast(
         if selection == "greedy":
             for u in remaining:
                 ui = int(u)
-                gain, _, alpha = marginal_gain_for_node(Z, Q, s, S_idx, ui)
+                gain, _, alpha = marginal_gain_for_node(Z, Q, s, S_idx, ui, nu=nu)
                 if alpha <= 1e-12 or gain <= 1e-9:
                     continue
 
@@ -325,13 +327,11 @@ def robust_opinion_seeding_fast(
     name: str,
     b: int = 100,
     seed: int = 0,
-    rho: float = 0.1,
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, float]:
     if len(Cs) == 0:
         raise ValueError("Cs must be a non-empty list")
 
     L = sparse_laplacian(G)
-
 
     n = len(G)
     eps = 0.1
@@ -355,9 +355,6 @@ def robust_opinion_seeding_fast(
     S: List[int] = []
     Q = None
     initial_objective_value: Optional[float] = None
-
-    
-
 
     for i, bu in enumerate(S_ordered[:b]):
         Q, _, delta, delta_S = _append_seeded_node(Z_nom, Q, s, S, int(bu))
@@ -409,6 +406,8 @@ def robust_opinion_seeding_active_set(
     
     L_plus_I = L + sp.identity(n, format="csr")
     U0, R0, X0, M0 = sketch_solve(L_plus_I, q, seed)
+    Z = M0 * Cbar
+    Z_cond = np.linalg.cond(Z)
 
     initial_disparity = s0.T @ (M0 * Cbar) @ s0
     initial_benefit = 0
@@ -459,15 +458,13 @@ def robust_opinion_seeding_active_set(
         'Number of Nodes': n,
     })
 
-
     for k in range(K):
-        alpha_rob = 1 + np.log(k + 1)
-        b_rob = int(p * alpha_rob)
+        alpha_rob = 1 + Z_cond * np.log(k + 1)
+        b_rob = int(b * alpha_rob)
         C0, disparity_current, benefit_current = active_set[-1]
 
         Cs = [a[0].copy() for a in active_set]
 
-        # optimize for S by running robust_opinion_seeding_fast
         df_inner, delta_final, delta_final_S, S_eta_time = robust_opinion_seeding_fast(G, s, Cs, name, b=b_rob, seed=seed)
         df_inner['k'] = k + 1
 
@@ -488,8 +485,6 @@ def robust_opinion_seeding_active_set(
 
         active_set.append((C_new.copy(), disparity_new, benefit_new))
 
-
-        
         records_outer.append({
             'Name': name,
             'Metric': 'Disparity',

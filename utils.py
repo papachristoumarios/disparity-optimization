@@ -533,6 +533,7 @@ def solve_with_cholesky(L, b):
     y = solve_triangular(L, b, lower=True, check_finite=False)
     x = solve_triangular(L.T, y, lower=False, check_finite=False)
     return x
+    
 @dataclass
 class ScenarioOracle:
     """

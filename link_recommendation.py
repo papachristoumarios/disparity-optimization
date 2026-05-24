@@ -2348,7 +2348,7 @@ def experiment_8_robust_link_recommendation_baselines(args: argparse.Namespace) 
 def experiment_9_predictive_model(args: argparse.Namespace) -> None:
     out_dir = args.out_dir
     datasets = get_datasets(args)   
-    train_data_fractions = np.array([0.1, 0.2, 0.3])
+    train_data_fractions = np.array([0.1, 0.2])
     train_val_split = 0.8
 
     if args.cached_results:
@@ -2443,12 +2443,12 @@ def experiment_9_predictive_model(args: argparse.Namespace) -> None:
 
                     Cbar_pred = label_predictions @ label_predictions.T
 
-                    print(f"Test Accuracy for {name} {group_type} {train_data_fraction}: {test_accuracy}")
-
                     rho = (1 - train_data_fraction) * (1 - accuracy)
+
+                    print(f"Test Accuracy for {name} {group_type} {train_data_fraction}: {test_accuracy}, rho={rho}")
+
                     T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
                     
-                    K = 10
                     df_inner, df_outer, eta_time, _, _ = robust_link_recommendation(
                         G=G.copy(),
                         Cbar=Cbar_pred,
