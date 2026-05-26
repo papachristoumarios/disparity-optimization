@@ -18,7 +18,7 @@ from utils import *
 import os
 rng = np.random.default_rng(0)
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 
 sns.set_theme(
     style="whitegrid",
@@ -64,7 +64,6 @@ def _append_auxiliary_inner_records(
     initial_edge_mass: float,
     initial_num_edges: int,
 ) -> None:
-    """Append cross/within influence, churn, and inter/intra weight-Δ rows (one row per metric)."""
     if Cbar_for_groups is None:
         return
     mc, mw = mean_M_cross_within_pairs(M, Cbar_for_groups)
@@ -2348,7 +2347,7 @@ def experiment_8_robust_link_recommendation_baselines(args: argparse.Namespace) 
 def experiment_9_predictive_model(args: argparse.Namespace) -> None:
     out_dir = args.out_dir
     datasets = get_datasets(args)   
-    train_data_fractions = np.array([0.1, 0.2])
+    train_data_fractions = np.array([0.075, 0.1])
     train_val_split = 0.8
 
     if args.cached_results:
@@ -2411,13 +2410,34 @@ def experiment_9_predictive_model(args: argparse.Namespace) -> None:
                     val_labels = labels[val_indices].flatten()
 
                     model = LogisticRegression(max_iter=1000)
-                    model.fit(train_embeddings, train_labels)
-
-
-                    val_predictions = model.predict(val_embeddings)
-
-                    accuracy = float(np.mean(val_predictions == val_labels))
-                    print(f"Validation Accuracy for {name} {group_type} {train_data_fraction}: {accuracy}")
+                    class_counts = np.bincount(train_labels.astype(int))
+                    n_cv_splits = min(5, int(class_counts.min()))
+                    if n_cv_splits >= 2:
+                        cv = StratifiedKFold(
+                            n_splits=n_cv_splits,
+                            shuffle=True,
+                            random_state=args.seed,
+                        )
+                        cv_scores = cross_val_score(
+                            LogisticRegression(max_iter=1000),
+                            train_embeddings,
+                            train_labels,
+                            cv=cv,
+                            scoring="accuracy",
+                        )
+                        accuracy = float(cv_scores.mean())
+                        print(
+                            f"CV Accuracy ({n_cv_splits}-fold) for {name} {group_type} "
+                            f"{train_data_fraction}: {accuracy}"
+                        )
+                        model.fit(train_embeddings, train_labels)
+                    else:
+                        model.fit(train_embeddings, train_labels)
+                        accuracy = float(np.mean(model.predict(val_embeddings) == val_labels))
+                        print(
+                            f"Validation Accuracy (hold-out) for {name} {group_type} "
+                            f"{train_data_fraction}: {accuracy}"
+                        )
 
                     train_val_indices = np.concatenate([train_indices, val_indices])
                     all_indices = np.arange(n_labels)
