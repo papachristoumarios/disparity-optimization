@@ -116,7 +116,6 @@ def parse_args():
     parser.add_argument('--experiment_list', type=str, nargs='+', default=['1'])
     parser.add_argument("--out-dir", type=str, default='figures')
     parser.add_argument("--rho", type=float, default=1.0)
-    parser.add_argument('--eta', type=float, default=1.0)
     parser.add_argument('--batch_size', type=int, default=100)
     parser.add_argument('--eps', type=float, default=0.1)
     parser.add_argument('--seed', type=int, default=0)
@@ -210,7 +209,7 @@ def robust_link_recommendation(G: nx.Graph, Cbar: np.ndarray, rho: float, name: 
             name=name,
             T_L=T_L,
             batch_size=batch_size,
-            eta=eta_L,
+            eta=np.sqrt(G.number_of_edges() / 2),
             seed=seed,
             Cbar_for_groups=Cbar,
         )
@@ -376,7 +375,7 @@ def link_recommendation(
         u_plus, v_plus = edge_plus
         u_minus, v_minus = edge_minus
 
-        eta_current = eta
+        eta_current = eta / np.sqrt(i + 1)
         weight_change = max(0.0, min(eta_current, H[u_plus][v_plus]['weight'], H[u_minus][v_minus]['weight']))
 
         if Cbar_for_groups is not None:
@@ -1340,12 +1339,94 @@ def _experiment_4_inner_last_run(df: pd.DataFrame) -> pd.DataFrame:
         frozenset({"Surrogate", "Disparity", "Polarization", _FROBENIUS_METRIC_LABEL}),
     )
 
+def experiment_0_network_statistics(args: argparse.Namespace):
+    out_dir = args.out_dir
+    datasets = get_datasets(args)
+
+    records = []
+    records_rho = []
+
+    rho_values = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5])
+
+    for name, group_types in datasets:
+        for group_type in group_types:
+            G, s, Cbar, labels = load_dataset(name, group_type, return_labels=True)
+            n = G.number_of_nodes()
+            m = G.number_of_edges()
+            d = G.degree()
+            d_avg = np.mean(d)
+            d_max = np.max(d)
+
+            # fiedler value
+            L = sparse_laplacian(G)
+            eigenvalues, _ = spla.eigsh(L, k=2, which="SA")
+            fiedler_value = eigenvalues[1]
+
+            eps = 0.1
+            q = max(int(np.log(n) / eps**2), 1)
+            L_plus_I = L + sp.identity(n, format="csr")
+
+            U, R, X, M = sketch_solve(L_plus_I, q, seed=args.seed)
+            Z = M * Cbar
+            Z_tilde = X * Cbar
+
+            realized_polarization = s.T @ M @ s
+            realized_disparity = s.T @ Z @ s
+            realized_surrogate = s.T @ Z_tilde @ s
+
+            records.append({
+                'Name': name,
+                '# Nodes': n,
+                '# Edges': m,
+                'Avg. Degree': d_avg,
+                'Max Degree': d_max,
+                '$\\lambda_2$': fiedler_value,
+                'Realized Polarization': realized_polarization,
+                'Realized Disparity': realized_disparity,
+                'Realized Surrogate': realized_surrogate,
+            })
+
+            
+
+    df = pd.DataFrame(records)
+
+
+    n = df['# Nodes'].max()
+    lambda_2_range = np.arange(0, 1, 0.01)
+    rho_range = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5])
+    
+    # define a function
+    def lb(x, y):
+        return (1 - 2 * y)**2 * (1 + x)**2
+
+    X, Y = np.meshgrid(lambda_2_range, rho_range)
+    Z = lb(X, Y)
+
+    fig, ax = plt.subplots(figsize=(2 * FIGSIZE, FIGSIZE))
+    
+    fig.colorbar(ax.contourf(X, Y, Z, cmap='viridis'))
+    ax.contour(X, Y, Z, colors='black', linestyles='dashed', linewidths=0.5)
+
+    for name in df['Name'].unique():
+        df_name = df[df['Name'] == name]
+        ax.axvline(df_name['$\\lambda_2$'].values[0])
+        ax.text(df_name['$\\lambda_2$'].values[0], 0.4, name, rotation=90, ha='right', va='center', fontsize=16, color='white')
+
+    ax.annotate('increased\nrisk', xy=(lambda_2_range[-1] - 0.05, 0.05), xytext=(0.5, 0.25), arrowprops=dict(arrowstyle='->'), fontsize=16, color='white', ha='right', va='center')
+    ax.set_xlabel('Well-connectedness / Fiedler Value ($\\lambda_2$)')
+    ax.set_xticks([])
+    ax.set_ylabel('Classifier error probability ($\\rho$)')
+    ax.set_title('Ratio Lower Bound')
+    sns.despine(fig)
+    # fig.tight_layout()
+    fig.savefig(f'{out_dir}/experiment_0_network_statistics_lower_bound.pdf', dpi=300, bbox_inches='tight')
+
+    df.to_latex(f'{out_dir}/experiment_0_network_statistics.tex', index=False, float_format='%.2f')
+    
 
 def experiment_1_link_recommendation_oracle(args: argparse.Namespace):
     out_dir = args.out_dir
-
     datasets = get_datasets(args)
-
 
     if args.cached_results:
         concat_df = pd.read_csv(f'{out_dir}/experiment_1_link_recommendation_oracle.csv')
@@ -1357,7 +1438,8 @@ def experiment_1_link_recommendation_oracle(args: argparse.Namespace):
                 T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
                 T_C = 1
                 K = 1
-                df, L, X, M, H, eta_time = link_recommendation(G, s=None if args.s_type == 'actual' else s, C=Cbar, name=name, T_L=T_L, batch_size=args.batch_size, eta=args.eta, seed=args.seed)
+                eta = np.sqrt(G.number_of_edges() / 2)
+                df, L, X, M, H, eta_time = link_recommendation(G, s=None if args.s_type == 'actual' else s, C=Cbar, name=name, T_L=T_L, batch_size=args.batch_size, eta=eta, seed=args.seed)
 
                 df['Name'] = name
                 df['Nominal Partition Type'] = group_type
@@ -1433,12 +1515,13 @@ def experiment_2_link_recommendation_oracle(args: argparse.Namespace):
         for name, group_types in datasets:
             for group_type in set(group_types) - {'polarization'}:
                 print(f"Running {name} with {group_type}")
-                G, s, Cbar = load_dataset(name, group_type)
+                G, s, Cbar, labels = load_dataset(name, group_type, return_labels=True)
                 T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
 
                 for p in p_values:
-                    C = generate_correlation_matrix_scenario(Cbar, mode='classifier_error', p=p)
-                    df, L, X, M, H, eta_time = link_recommendation(G, s=s if args.s_type == 'actual' else None, C=C, name=name, T_L=T_L, batch_size=args.batch_size, eta=1.0, seed=args.seed)
+                    C = corr_from_labels(labels, rho=p)
+                    eta = np.sqrt(G.number_of_edges() / 2)
+                    df, L, X, M, H, eta_time = link_recommendation(G, s=s if args.s_type == 'actual' else None, C=C, name=name, T_L=T_L, batch_size=args.batch_size, eta=eta, seed=args.seed)
 
                     df['Name'] = name
                     df['Nominal Partition Type'] = group_type
@@ -1883,7 +1966,7 @@ def experiment_5_fiedler_gradient_ascent(args: argparse.Namespace):
                     name,
                     T_L=T_L,
                     batch_size=args.batch_size,
-                    eta=args.eta,
+                    eta=np.sqrt(G.number_of_edges() / 2),
                     seed=args.seed,
                 )
 
@@ -2031,7 +2114,7 @@ def experiment_6_link_recommendation_baselines(args: argparse.Namespace) -> None
 
         for name, group_types in datasets:
             for group_type in set(group_types) - {'polarization'}:
-                G, s, Cbar = load_dataset(name, group_type)
+                G, s, Cbar, labels = load_dataset(name, group_type, return_labels=True)
                 T_L, _, _, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
                 for sel in selections:
                     print(f"Exp6 {name} {group_type} {METHOD_LABELS[sel]}")
@@ -2042,7 +2125,7 @@ def experiment_6_link_recommendation_baselines(args: argparse.Namespace) -> None
                         name,
                         T_L=T_L,
                         batch_size=args.batch_size,
-                        eta=args.eta,
+                        eta=np.sqrt(G.number_of_edges() / 2),
                         seed=args.seed,
                         selection=sel,
                         track_fiedler=False,
@@ -2161,7 +2244,7 @@ def experiment_7_fiedler_baselines(args: argparse.Namespace) -> None:
                         name,
                         T_L=T_L,
                         batch_size=args.batch_size,
-                        eta=args.eta,
+                        eta=np.sqrt(G.number_of_edges() / 2),
                         seed=args.seed,
                         selection=sel,
                         track_fiedler=True,
@@ -2290,7 +2373,7 @@ def experiment_8_robust_link_recommendation_baselines(args: argparse.Namespace) 
                                 T_C=T_C,
                                 K=K,
                                 batch_size=args.batch_size,
-                                eta_L=1.0,
+                                eta_L=np.sqrt(G.number_of_edges() / 2),
                                 eta_C=2 * rho,
                                 seed=args.seed,
                                 betweenness_refresh=args.betweenness_refresh,
@@ -2346,9 +2429,8 @@ def experiment_8_robust_link_recommendation_baselines(args: argparse.Namespace) 
 
 def experiment_9_predictive_model(args: argparse.Namespace) -> None:
     out_dir = args.out_dir
-    datasets = get_datasets(args)   
-    train_data_fractions = np.array([0.075, 0.1])
-    train_val_split = 0.8
+    datasets = [('polblogs', ['label'])]  
+    train_data_fractions = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
 
     if args.cached_results:
         df_all = pd.read_csv(f"{out_dir}/experiment_9_predictive_model.csv")
@@ -2386,89 +2468,47 @@ def experiment_9_predictive_model(args: argparse.Namespace) -> None:
         
                 n_labels = len(labels)
                 for train_data_fraction in train_data_fractions:
-                    train_size = max(2, int(train_data_fraction * n_labels))
-                    val_size = max(1, int((1 - train_val_split) * train_size))
-                    train_size = min(train_size, n_labels - 2)
-                    val_size = min(val_size, n_labels - train_size - 1)
-                    if train_size <= val_size or val_size <= 0:
-                        continue
-                    
-                    train_indices = []
-                    val_indices = []
-                    for label in np.unique(labels):
-                        label_indices = np.where(labels == label)[0]
-                        rng_local.shuffle(label_indices)
-                        train_indices.extend(label_indices[:train_size // len(np.unique(labels))])
-                        val_indices.extend(label_indices[train_size // len(np.unique(labels)) : train_size // len(np.unique(labels)) + val_size // len(np.unique(labels))])
+                    labels = labels.flatten()
 
-                    train_indices = np.array(train_indices)
-                    val_indices = np.array(val_indices)
-                    
-                    train_embeddings = embeddings[train_indices]
-                    val_embeddings = embeddings[val_indices]
-                    train_labels = labels[train_indices].flatten()
-                    val_labels = labels[val_indices].flatten()
+                    X_train, X_test, y_train, y_test, train_indices, test_indices = train_test_split(
+                        embeddings,
+                        labels,
+                        np.arange(n_labels),
+                        test_size=1 - train_data_fraction,
+                        stratify=labels,
+                        random_state=args.seed,
+                    )
 
+                    n_cv_splits = min(5, int(np.bincount(y_train.astype(int)).min()))
+
+                    # train logistic regression model with k-fold cross-validation
                     model = LogisticRegression(max_iter=1000)
-                    class_counts = np.bincount(train_labels.astype(int))
-                    n_cv_splits = min(5, int(class_counts.min()))
-                    if n_cv_splits >= 2:
-                        cv = StratifiedKFold(
-                            n_splits=n_cv_splits,
-                            shuffle=True,
-                            random_state=args.seed,
-                        )
-                        cv_scores = cross_val_score(
-                            LogisticRegression(max_iter=1000),
-                            train_embeddings,
-                            train_labels,
-                            cv=cv,
-                            scoring="accuracy",
-                        )
-                        accuracy = float(cv_scores.mean())
-                        print(
-                            f"CV Accuracy ({n_cv_splits}-fold) for {name} {group_type} "
-                            f"{train_data_fraction}: {accuracy}"
-                        )
-                        model.fit(train_embeddings, train_labels)
-                    else:
-                        model.fit(train_embeddings, train_labels)
-                        accuracy = float(np.mean(model.predict(val_embeddings) == val_labels))
-                        print(
-                            f"Validation Accuracy (hold-out) for {name} {group_type} "
-                            f"{train_data_fraction}: {accuracy}"
-                        )
+                    model.fit(X_train, y_train)
+                    cv = StratifiedKFold(n_splits=n_cv_splits, shuffle=True, random_state=args.seed)
+                    cv_scores = cross_val_score(model, X_train, y_train, cv=cv, scoring="accuracy")
+                    accuracy = float(cv_scores.mean())
+                    accuracy_std = float(cv_scores.std())
+                    print(f"CV Accuracy ({n_cv_splits}-fold) for {name} {group_type} {train_data_fraction}: {accuracy} ± {accuracy_std}")
 
-                    train_val_indices = np.concatenate([train_indices, val_indices])
-                    all_indices = np.arange(n_labels)
+                    y_pred = model.predict(X_test)
 
-                    test_indices = np.setdiff1d(all_indices, train_val_indices)
-                    test_embeddings = embeddings[test_indices]
-                    test_labels = labels[test_indices].flatten()
-                    test_predictions = model.predict(test_embeddings)
-                    test_accuracy = float(np.mean(test_predictions == test_labels))
+                    test_accuracy = float(np.mean(y_pred == y_test))
 
-                    label_predictions = labels.copy()
 
-                    val_labels = 2 * (val_labels > 0.5).astype(float) - 1
-                    test_labels = 2 * (test_labels > 0.5).astype(float) - 1
+                    labels_predictions = np.zeros(n_labels)
+                    labels_predictions[test_indices] = 2 * y_pred - 1
+                    labels_predictions[train_indices] = 2 * y_train - 1
 
-                    val_labels = val_labels.reshape(-1, 1)
-                    test_labels = test_labels.reshape(-1, 1)
+                    Cbar_pred = np.outer(labels_predictions, labels_predictions)
 
-                    label_predictions[val_indices] = val_labels
-                    label_predictions[test_indices] = test_labels
-
-                    label_predictions = label_predictions.reshape(-1, 1)
-
-                    Cbar_pred = label_predictions @ label_predictions.T
-
-                    rho = (1 - train_data_fraction) * (1 - accuracy)
+                    rho = (1 - train_data_fraction) * (1 - (accuracy - accuracy_std))
 
                     print(f"Test Accuracy for {name} {group_type} {train_data_fraction}: {test_accuracy}, rho={rho}")
 
                     T_L, T_C, K, q = get_iteration_parameters(G.number_of_nodes(), args.eps)
                     
+                    K = 3
+
                     df_inner, df_outer, eta_time, _, _ = robust_link_recommendation(
                         G=G.copy(),
                         Cbar=Cbar_pred,
@@ -2478,7 +2518,7 @@ def experiment_9_predictive_model(args: argparse.Namespace) -> None:
                         K=K,
                         T_L=T_L,
                         T_C=T_C,
-                        eta_L=1.0,
+                        eta_L=np.sqrt(G.number_of_edges() / 2),
                         eta_C=2 * rho,
                         batch_size=args.batch_size,
                         seed=args.seed,
@@ -2535,8 +2575,8 @@ def experiment_9_predictive_model(args: argparse.Namespace) -> None:
 
     fig_a, ax_a = plt.subplots(
         nrows=1,
-        ncols=(1 + num_names),
-        figsize=(FIGSIZE * (1 + num_names), FIGSIZE),
+        ncols=(2 + num_names),
+        figsize=(FIGSIZE * (2 + num_names), FIGSIZE),
         squeeze=False,
     )
     fig_b, ax_b = plt.subplots(
@@ -2605,9 +2645,15 @@ def experiment_9_predictive_model(args: argparse.Namespace) -> None:
             if j == 0:
                 ax_b[j, i].set_title(name)
 
-    sns.barplot(x='Fraction of Training Data', y='Accuracy', hue='Name', data=plot_df, ax=ax_a[0, -1], dodge=True, legend=True)
+    sns.scatterplot(x='Fraction of Training Data', y='Rho', hue='Name', data=plot_df, ax=ax_a[0, -2], legend=True)
+    ax_a[0, -2].set_xlabel("Fraction of training data")
+    ax_a[0, -2].set_ylabel("$\\hat \\rho$")
+    ax_a[0, -2].set_ylim(0.0, 0.5)
+
+    sns.scatterplot(x='Fraction of Training Data', y='Accuracy', hue='Name', data=plot_df, ax=ax_a[0, -1], legend=True)
     ax_a[0, -1].set_xlabel("Fraction of training data")
     ax_a[0, -1].set_ylabel("Test Accuracy")
+    ax_a[0, -1].set_ylim(0.9, 1.0)
 
     plot_df_sorted = plot_df.sort_values(by="Number of Nodes")
     df_rt = plot_df_sorted.drop_duplicates(subset=["Name", "Fraction of Training Data"], keep="first")
@@ -2627,6 +2673,7 @@ def experiment_9_predictive_model(args: argparse.Namespace) -> None:
 
 def main(args: argparse.Namespace) -> None:
     experiment_dict = dict([
+        (0, experiment_0_network_statistics),
         (1, experiment_1_link_recommendation_oracle),
         (2, experiment_2_link_recommendation_oracle),
         (3, experiment_3_worst_case_C_oracle),

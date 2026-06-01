@@ -66,36 +66,9 @@ def parse_args():
     parser.add_argument('--embedding_type', default='precomputed', choices=['node2vec', 'gaussian', 'network_structure', 'precomputed'])
     parser.add_argument('--cached_results', action='store_true')
     parser.add_argument('--b', type=int, default=100)
+    parser.add_argument('--ridge', type=float, default=2.0)
     return parser.parse_args()
 
-def cholesky_add_node(L, z, z_uu, jitter=1e-12):
-    if L is None:
-        alpha = float(z_uu)
-        if alpha <= 0:
-            alpha = jitter
-        L_new = np.array([[np.sqrt(alpha)]], dtype=float)
-        return L_new, alpha
-
-    z = np.asarray(z, dtype=np.float64).ravel()
-    if z.size != L.shape[0]:
-        raise ValueError(
-            f"cholesky_add_node: len(z)={z.size} != L.shape[0]={L.shape[0]}"
-        )
-
-    # Solve L v = z  (so v = L^{-1} z)
-    v = solve_triangular(L, z, lower=True, check_finite=False)
-
-    # Schur complement
-    alpha = float(z_uu - np.dot(v, v))
-    if alpha <= jitter:
-        alpha = jitter
-
-    m = L.shape[0]
-    L_new = np.zeros((m + 1, m + 1), dtype=float)
-    L_new[:m, :m] = L
-    L_new[m, :m] = v
-    L_new[m, m] = np.sqrt(alpha)
-    return L_new, alpha
 
 def marginal_gain_for_node(
     Z: np.ndarray,
@@ -103,15 +76,12 @@ def marginal_gain_for_node(
     s: np.ndarray,
     S_idx: np.ndarray,
     u: int,
-    nu: float = 1.0,
+    ridge: float = 0.0,
 ) -> Tuple[float, Optional[np.ndarray], float]:
-    """
-    Marginal benefit of adding u to S for F(S) = s^T P_S s:
-        gain = (s^T q_u)^2 / alpha,  q_u = Z_{:,u} - Z_{:,S} Z_SS^{-1} Z_{S,u}.
-    """
+
     ui = int(u)
     if len(S_idx) == 0:
-        alpha = float(Z[ui, ui])
+        alpha = float(Z[ui, ui] + ridge)
         if alpha <= 1e-12:
             return 0.0, None, alpha
         q_u = Z[:, ui]
@@ -119,7 +89,7 @@ def marginal_gain_for_node(
     else:
         z = Z[np.ix_(S_idx, np.array([ui], dtype=np.intp))].reshape(-1)
         v = solve_with_cholesky(Q, z)
-        alpha = float(Z[ui, ui] - np.dot(z, v))
+        alpha = float(Z[ui, ui] + ridge - np.dot(z, v))
         alpha = max(alpha, 1e-12)
         q_u = Z[:, ui] - Z[:, S_idx] @ v
         z_col = z.astype(np.float64, copy=False)
@@ -131,49 +101,20 @@ def marginal_gain_for_node(
 
 
 def benefit_fixed_set(Z: np.ndarray, s: np.ndarray, S: Sequence[int], ridge: float = 1e-8) -> float:
-    """F(S) = s^T P_S s for a fixed set S."""
+    """F(S) with (Z_SS + ridge I)^{-1} in the pseudoinverse / projection."""
     if len(S) == 0:
         return 0.0
     S_idx = np.asarray(S, dtype=np.intp)
     ZSS = 0.5 * (Z[np.ix_(S_idx, S_idx)] + Z[np.ix_(S_idx, S_idx)].T)
-    ridge_eff = max(ridge, 1e-8 * len(S_idx))
-    ZSS = ZSS + ridge_eff * np.eye(len(S_idx))
+    ZSS = ZSS + ridge * np.eye(len(S_idx))
     try:
         L = np.linalg.cholesky(ZSS)
     except np.linalg.LinAlgError:
-        ZSS = project_psd(ZSS, eps=ridge_eff)
+        ZSS = project_psd(ZSS, eps=1e-8)
         L = np.linalg.cholesky(ZSS)
     v = Z[np.ix_(S_idx, np.arange(Z.shape[0]))] @ s
     x = solve_with_cholesky(L, v)
     return max(float(v @ x), 0.0)
-
-
-def compute_delta_with_factor(Z, Q, s, S, ridge=1e-8, normalize: bool = False):
-    n = Z.shape[0]
-    # Preserve insertion order: Q matches Z_SS in this row/column order, not sorted(S).
-    S = np.asarray(S, dtype=int)
-    bar = np.array([i for i in range(n) if i not in set(S.tolist())], dtype=int)
-
-    if len(S) == 0:
-        return np.zeros(n), np.array([])
-
-    ZSS = 0.5 * (Z[np.ix_(S, S)] + Z[np.ix_(S, S)].T)
-    ZSS = ZSS + ridge * np.eye(len(S))
-    
-
-    ZSbar = Z[np.ix_(S, bar)]
-    sbar = s[bar]
-    rhs = ZSbar @ sbar
-
-    # delta_S* = - Z_SS^{-1} Z_Sbar s_bar
-    delta_S = -solve_with_cholesky(Q, rhs)
-
-    if normalize:
-        delta_S = delta_S / np.linalg.norm(delta_S)
-
-    delta = np.zeros(n, dtype=float)
-    delta[S] = delta_S
-    return delta, delta_S
 
 
 def _baseline_node_order(G: nx.Graph, selection: str, seed: int) -> List[int]:
@@ -198,10 +139,11 @@ def _append_seeded_node(
     s: np.ndarray,
     S: List[int],
     bu: int,
+    ridge: float = 0.0,
 ) -> Tuple[Optional[np.ndarray], float, np.ndarray, np.ndarray]:
     """Add node ``bu`` to ``S``, update Cholesky ``Q``, return gain and intervention."""
     S_idx = np.asarray(S, dtype=np.intp)
-    gain, z_col, alpha = marginal_gain_for_node(Z, Q, s, S_idx, int(bu))
+    gain, z_col, alpha = marginal_gain_for_node(Z, Q, s, S_idx, int(bu), ridge=ridge)
 
     if len(S) > 0:
         z_col = (
@@ -210,10 +152,11 @@ def _append_seeded_node(
             .astype(np.float64, copy=False)
         )
 
+    z_uu = float(Z[int(bu), int(bu)] + ridge)
     if len(S) == 0:
-        Q_new, _ = cholesky_add_node(None, np.array([]), Z[int(bu), int(bu)])
+        Q_new, _ = cholesky_add_node(None, np.array([]), z_uu)
     else:
-        Q_new, _ = cholesky_add_node(Q, z_col, Z[int(bu), int(bu)])
+        Q_new, _ = cholesky_add_node(Q, z_col, z_uu)
 
     S.append(int(bu))
     delta, delta_S = compute_delta_with_factor(Z, Q_new, s, S)
@@ -228,7 +171,7 @@ def opinion_seeding_fast(
     b: int = 100, 
     seed: int = 0,
     selection: str = "greedy",
-    nu: float = 1.0,
+    ridge: float = 1e-8,
 ) -> pd.DataFrame:
     if selection not in OPINION_SEEDING_METHOD_LABELS:
         raise ValueError(f"selection must be one of {list(OPINION_SEEDING_METHOD_LABELS)}")
@@ -269,7 +212,9 @@ def opinion_seeding_fast(
         if selection == "greedy":
             for u in remaining:
                 ui = int(u)
-                gain, _, alpha = marginal_gain_for_node(Z, Q, s, S_idx, ui, nu=nu)
+                gain, _, alpha = marginal_gain_for_node(
+                    Z, Q, s, S_idx, ui, ridge=ridge
+                )
                 if alpha <= 1e-12 or gain <= 1e-9:
                     continue
 
@@ -286,9 +231,13 @@ def opinion_seeding_fast(
             if i >= len(baseline_order):
                 break
             bu = int(baseline_order[i])
-            step_gain, _, _ = marginal_gain_for_node(Z, Q, s, S_idx, bu)
+            step_gain, _, _ = marginal_gain_for_node(
+                Z, Q, s, S_idx, bu, ridge=ridge
+            )
 
-        Q, step_gain, delta, delta_S = _append_seeded_node(Z, Q, s, S, bu)
+        Q, step_gain, delta, delta_S = _append_seeded_node(
+            Z, Q, s, S, bu, ridge=ridge
+        )
         remaining.remove(bu)
         objective_value += step_gain
 
@@ -327,6 +276,7 @@ def robust_opinion_seeding_fast(
     name: str,
     b: int = 100,
     seed: int = 0,
+    ridge: float = 1e-8,
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, float]:
     if len(Cs) == 0:
         raise ValueError("Cs must be a non-empty list")
@@ -340,7 +290,9 @@ def robust_opinion_seeding_fast(
     L_plus_I = L + sp.identity(n, format="csr")
     U, R, X, M = sketch_solve(L_plus_I, q, seed)
 
-    oracles = [ScenarioOracle(Z=M * C_scenario, s=s) for C_scenario in Cs]
+    oracles = [
+        ScenarioOracle(Z=M * C_scenario, s=s, ridge=ridge) for C_scenario in Cs
+    ]
     Z_nom = M * Cs[0]
 
     start_time = time.time()
@@ -357,8 +309,12 @@ def robust_opinion_seeding_fast(
     initial_objective_value: Optional[float] = None
 
     for i, bu in enumerate(S_ordered[:b]):
-        Q, _, delta, delta_S = _append_seeded_node(Z_nom, Q, s, S, int(bu))
-        objective_value = min(oracle.benefit(set(S)) for oracle in oracles)
+        Q, _, delta, delta_S = _append_seeded_node(
+            Z_nom, Q, s, S, int(bu), ridge=ridge
+        )
+        objective_value = min(
+            oracle.benefit(set(S)) for oracle in oracles
+        )
 
         if initial_objective_value is None:
             initial_objective_value = objective_value
@@ -394,6 +350,7 @@ def robust_opinion_seeding_active_set(
     b: int = 100,
     seed: int = 0,
     K : int = 10,
+    ridge: float = 1e-8,
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, float]:
     
     L = sparse_laplacian(G)
@@ -407,12 +364,17 @@ def robust_opinion_seeding_active_set(
     L_plus_I = L + sp.identity(n, format="csr")
     U0, R0, X0, M0 = sketch_solve(L_plus_I, q, seed)
     Z = M0 * Cbar
-    Z_cond = np.linalg.cond(Z)
 
     initial_disparity = s0.T @ (M0 * Cbar) @ s0
     initial_benefit = 0
 
-    active_set = [(Cbar.copy(),  initial_disparity, initial_benefit)]
+    initial_Z_cond = np.linalg.cond(Z + ridge * np.eye(n))
+    initial_alpha_rob = 1 + initial_Z_cond * np.log(1)
+    initial_b_rob = int(b * initial_alpha_rob)
+
+    print('Initial Z cond', initial_Z_cond)
+
+    active_set = [(Cbar.copy(),  initial_disparity, initial_benefit, initial_Z_cond, initial_b_rob)]
 
     records_inner = []  
     records_outer = []  
@@ -429,6 +391,8 @@ def robust_opinion_seeding_active_set(
         'k': 0,
         'Rho': rho,
         'Number of Nodes': n,
+        'Budget': b,
+        'Robust Budget': initial_b_rob,
     })
     records_outer.append({
         'Name': name,
@@ -438,6 +402,8 @@ def robust_opinion_seeding_active_set(
         'k': 0,
         'Rho': rho,
         'Number of Nodes': n,
+        'Budget': b,
+        'Robust Budget': initial_b_rob,
     })
     records_outer.append({
         'Name': name,
@@ -447,6 +413,8 @@ def robust_opinion_seeding_active_set(
         'k': 0,
         'Rho': rho,
         'Number of Nodes': n,
+        'Budget': b,
+        'Robust Budget': initial_b_rob,
     })
     records_outer.append({
         'Name': name,
@@ -456,16 +424,19 @@ def robust_opinion_seeding_active_set(
         'k': 0,
         'Rho': rho,
         'Number of Nodes': n,
+        'Budget': b,
+        'Robust Budget': initial_b_rob,
     })
 
     for k in range(K):
-        alpha_rob = 1 + Z_cond * np.log(k + 1)
-        b_rob = int(b * alpha_rob)
-        C0, disparity_current, benefit_current = active_set[-1]
+        C0, disparity_current, benefit_current, Z_cond_current, b_rob_current = active_set[-1]
+        print(f"Step k = {k + 1} / {K}, current robust budget: {b_rob_current}, benefit: {benefit_current}")
 
         Cs = [a[0].copy() for a in active_set]
 
-        df_inner, delta_final, delta_final_S, S_eta_time = robust_opinion_seeding_fast(G, s, Cs, name, b=b_rob, seed=seed)
+        df_inner, delta_final, delta_final_S, S_eta_time = robust_opinion_seeding_fast(
+            G, s, Cs, name, b=b_rob_current, seed=seed, ridge=ridge, 
+        )
         df_inner['k'] = k + 1
 
         eta_time += S_eta_time
@@ -480,10 +451,11 @@ def robust_opinion_seeding_active_set(
 
         eta_time += C_eta_time
 
-        if np.isclose(benefit_new, benefit_current, rtol=1e-6):
-            break
 
-        active_set.append((C_new.copy(), disparity_new, benefit_new))
+        Z_cond_new = np.linalg.cond(M0 * C_new + ridge * np.eye(n))
+        alpha_rob = 1 + Z_cond_new * np.log(k + 2)
+        b_rob_new = max(b_rob_current, int(b * alpha_rob))
+
 
         records_outer.append({
             'Name': name,
@@ -493,6 +465,8 @@ def robust_opinion_seeding_active_set(
             'k': k + 1,
             'Rho': rho,
             'Number of Nodes': n,
+            'Budget': b,
+            'Robust Budget': b_rob_new,
         })
 
         records_outer.append({
@@ -503,6 +477,8 @@ def robust_opinion_seeding_active_set(
             'k': k + 1,
             'Rho': rho,
             'Number of Nodes': n,
+            'Budget': b,
+            'Robust Budget': b_rob_new,
         })
 
         diff_C = C_new - Cbar
@@ -518,6 +494,8 @@ def robust_opinion_seeding_active_set(
                 "k": k + 1,
                 "Rho": rho,
                 "Number of Nodes": n,
+                "Budget": b,
+                "Robust Budget": b_rob_new,
             }
         )
         records_outer.append(
@@ -529,11 +507,18 @@ def robust_opinion_seeding_active_set(
                 "k": k + 1,
                 "Rho": rho,
                 "Number of Nodes": n,
+                "Budget": b,
+                "Robust Budget": b_rob_new,
             }
         )
 
         delta_final_prev = delta_final.copy()
         delta_final_S_prev = delta_final_S.copy()
+
+        if benefit_new < benefit_current:
+            active_set.append((C_new.copy(), disparity_new, benefit_new, Z_cond_new, b_rob_new))
+        else:
+            break
 
     df_inner = pd.concat(records_inner, ignore_index=True)
     df_outer = pd.DataFrame(records_outer)
@@ -549,9 +534,12 @@ def robust_opinion_seeding_random_scenarios(
     b: int = 100,
     seed: int = 0,
     num_scenarios: int = 3,
+    ridge: float = 1e-8,
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, float]:
     Cs = generate_scenarios(C, rho, num_scenarios)
-    return robust_opinion_seeding_fast(G, s, Cs, name, b=b, seed=seed)
+    return robust_opinion_seeding_fast(
+        G, s, Cs, name, b=b, seed=seed, ridge=ridge,
+    )
 
 
 def experiment_1_opinion_seeding_oracle(args: argparse.Namespace) -> None:
@@ -570,7 +558,9 @@ def experiment_1_opinion_seeding_oracle(args: argparse.Namespace) -> None:
                 print(f"Running {name} with {group_type}")
                 G, s, C_bar = load_dataset(name, group_type)
                
-                df, delta_final, delta_final_S, eta_time = opinion_seeding_fast(G, s, C_bar, name, args.b, args.seed)
+                df, delta_final, delta_final_S, eta_time = opinion_seeding_fast(
+                    G, s, C_bar, name, args.b, args.seed, ridge=args.ridge
+                )
 
                 delta_final = delta_final / np.linalg.norm(delta_final)
                 delta_final_S = delta_final_S / np.linalg.norm(delta_final_S)
@@ -580,6 +570,7 @@ def experiment_1_opinion_seeding_oracle(args: argparse.Namespace) -> None:
                 df['Number of Nodes'] = G.number_of_nodes()
                 df['Budget'] = args.b
                 df['Seed'] = args.seed
+                df['Ridge'] = args.ridge
                 df['Time (s)'] = eta_time
                 df['Per Step Time (s)'] = eta_time / args.b
 
@@ -638,7 +629,17 @@ def experiment_2_robust_opinion_seeding_random_scenarios(args: argparse.Namespac
                 print(f"Running {name} with {group_type}")
                 G, s, C_bar = load_dataset(name, group_type)
                 
-                df, delta_final, delta_final_S, eta_time = robust_opinion_seeding_random_scenarios(G, s, C_bar, args.rho, name, args.b, args.seed, num_scenarios=3)
+                df, delta_final, delta_final_S, eta_time = robust_opinion_seeding_random_scenarios(
+                    G,
+                    s,
+                    C_bar,
+                    args.rho,
+                    name,
+                    args.b,
+                    args.seed,
+                    num_scenarios=3,
+                    ridge=args.ridge,
+                )
 
                 delta_final = np.asarray(delta_final, dtype=float).reshape(-1)
                 delta_final_S = np.asarray(delta_final_S, dtype=float).reshape(-1)
@@ -652,6 +653,7 @@ def experiment_2_robust_opinion_seeding_random_scenarios(args: argparse.Namespac
                 df['Number of Nodes'] = G.number_of_nodes()
                 df['Budget'] = args.b
                 df['Seed'] = args.seed
+                df['Ridge'] = args.ridge
                 df['Time (s)'] = eta_time
                 df['Per Step Time (s)'] = eta_time / args.b
 
@@ -702,6 +704,7 @@ def experiment_4_robust_opinion_seeding_active_set(args: argparse.Namespace) -> 
     out_dir = args.out_dir
 
     datasets = get_datasets(args)
+    # datasets = [('twitter', ['spectral'])]
 
     if args.cached_results:
         concat_df_inner = pd.read_csv(f'{out_dir}/experiment_4_robust_opinion_seeding_active_set_inner.csv')
@@ -717,7 +720,17 @@ def experiment_4_robust_opinion_seeding_active_set(args: argparse.Namespace) -> 
                 print(f"Running {name} with {group_type}")
                 G, s, C_bar = load_dataset(name, group_type)
                 
-                df_inner, df_outer, delta_final, delta_final_S, eta_time = robust_opinion_seeding_active_set(G, s, C_bar, rho, name, args.b, args.seed, K=3)
+                df_inner, df_outer, delta_final, delta_final_S, eta_time = robust_opinion_seeding_active_set(
+                    G,
+                    s,
+                    C_bar,
+                    rho,
+                    name,
+                    args.b,
+                    args.seed,
+                    K=3,
+                    ridge=args.ridge,
+                )
 
                 df_inner['Name'] = name 
                 df_inner['Nominal Partition Type'] = group_type
@@ -726,6 +739,7 @@ def experiment_4_robust_opinion_seeding_active_set(args: argparse.Namespace) -> 
                 df_inner['Time (s)'] = eta_time
                 df_inner['Budget'] = args.b
                 df_inner['Rho'] = rho
+                df_inner['Ridge'] = args.ridge
 
                 df_outer['Name'] = name
                 df_outer['Nominal Partition Type'] = group_type
@@ -734,6 +748,7 @@ def experiment_4_robust_opinion_seeding_active_set(args: argparse.Namespace) -> 
                 df_outer['Time (s)'] = eta_time
                 df_outer['Budget'] = args.b
                 df_outer['Rho'] = rho
+                df_outer['Ridge'] = args.ridge
                 concat_df_inner.append(df_inner)
                 concat_df_outer.append(df_outer)
 
@@ -804,6 +819,7 @@ def experiment_3_opinion_seeding_baselines(args: argparse.Namespace) -> None:
                         args.b,
                         args.seed,
                         selection=sel,
+                        ridge=args.ridge,
                     )
                     df["Name"] = name
                     df["Nominal Partition Type"] = group_type
@@ -812,6 +828,7 @@ def experiment_3_opinion_seeding_baselines(args: argparse.Namespace) -> None:
                     df["Number of Nodes"] = G.number_of_nodes()
                     df["Budget"] = args.b
                     df["Seed"] = args.seed
+                    df["Ridge"] = args.ridge
                     df["Time (s)"] = eta_time
                     df["Per Step Time (s)"] = eta_time / max(len(df), 1)
                     concat_df.append(df)

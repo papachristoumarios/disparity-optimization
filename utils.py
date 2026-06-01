@@ -12,6 +12,7 @@ import scipy.sparse.linalg as spla
 from scipy.linalg import cho_factor, cho_solve, eigh, solve_triangular
 from tqdm import tqdm
 import time
+import argparse
 
 Array = np.ndarray
 Edge = Union[Tuple[int, int], Tuple[str, str]]
@@ -85,8 +86,6 @@ def graph_to_laplacian(G: nx.Graph, nodes: list[str]) -> sp.csr_matrix:
     return L
 
 def calculate_M_fast(L: sp.csr_matrix) -> sp.csr_matrix:
-    # M = (I + L)**(-2) 
-    # use eigenvalues and eigenvectors to compute M
     if isinstance(L, sp.csr_matrix):
         eigenvalues, eigenvectors = spla.eigsh(L.toarray(), k=min(L.shape[0], 10), which='SA')
     else:
@@ -95,8 +94,6 @@ def calculate_M_fast(L: sp.csr_matrix) -> sp.csr_matrix:
     return sp.csr_matrix(M)
 
 def calculate_X_fast(L: sp.csr_matrix) -> sp.csr_matrix:
-    # X = (I + L)**(-1) 
-    # use eigenvalues and eigenvectors to compute X
     if isinstance(L, sp.csr_matrix):
         eigenvalues, eigenvectors = spla.eigsh(L.toarray(), k=min(L.shape[0], 10), which='SA')
     else:
@@ -112,6 +109,7 @@ def calculate_auxiliary_matrices(L: sp.csr_matrix, C: sp.csr_matrix) -> Tuple[sp
     return M, X, Z, Z_tilde
 
 def normalize_unit(x: np.ndarray) -> np.ndarray:
+    x -= np.mean(x)
     nrm = np.linalg.norm(x)
     if nrm == 0:
         raise ValueError("Cannot normalize the zero vector.")
@@ -143,6 +141,8 @@ def load_dataset(name, group_type, return_labels: bool = False):
     G = largest_connected_component(G)
     
     opinion_map = load_opinions(f'data/{name}/opinions.txt')
+    opinion_map_mean = np.mean(list(opinion_map.values()))
+    opinion_map = {n: opinion_map[n] - opinion_map_mean for n in opinion_map}
     nodes = sorted(
         (str(v) for v in G.nodes() if str(v) in opinion_map),
         key=lambda x: int(x) if x.isdigit() else x,
@@ -169,7 +169,7 @@ def load_dataset(name, group_type, return_labels: bool = False):
     # relabel nodes of G 
     G = nx.relabel_nodes(G, {n: i for i, n in enumerate(nodes)})
     
-    Cbar = corr_from_labels(labels)
+    Cbar = corr_from_labels(labels, rho=0.0)
 
     for u, v in G.edges():
         G[u][v]['weight'] = 1.0
@@ -188,10 +188,22 @@ def sparse_laplacian(G: nx.Graph, nodelist: Optional[Sequence[int]] = None) -> s
     L = nx.laplacian_matrix(G, nodelist=nodelist, weight="weight")
     return L.tocsr().astype(float)
 
-def corr_from_labels(labels: Array) -> Array:
+def corr_from_labels(labels: Array, rho: float = 0.0) -> Array:
     """Correlation matrix from labels."""
-    labels = np.asarray(labels, dtype=float).reshape(-1)
-    C = np.outer(labels, labels)
+    labels = np.asarray(labels, dtype=float)
+    n = len(labels)
+
+    gamma = (1 - 2 * rho)**2
+
+    C = np.zeros((n, n))
+
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                C[i, j] = 1.0
+            else:
+                C[i, j] = labels[i] * labels[j] * gamma
+
     return C
 
 
@@ -293,14 +305,6 @@ def project_to_correlation(A: np.ndarray, n_iters: int = 20, eps: float = 1e-10)
         np.fill_diagonal(X, 1.0)
 
         X = 0.5 * (X + X.T)
-    return X
-
-
-def project_onto_U(C: np.ndarray, Cbar: np.ndarray, rho: float, n_rounds: int = 5, norm_constraint: str = 'classifier_error') -> np.ndarray:
-
-    X = C.copy()
-   
-   
     return X
 
 def worst_case_C_for_fixed_L(
@@ -433,7 +437,8 @@ def cholesky_add_node(L, z, z_uu, jitter=1e-12):
         Cross term Z_{S,u} for the new node u.
         If S is empty, pass an empty array.
     z_uu : float
-        Diagonal entry Z_{u,u}.
+        Pivot diagonal for the extended block. For ridge-regularized factors,
+        pass Z_{u,u} + ridge (so L factors Z_SS + ridge * I).
     jitter : float
         Numerical stabilization for tiny negative Schur complements.
 
@@ -473,25 +478,23 @@ def cholesky_add_node(L, z, z_uu, jitter=1e-12):
     L_new[m, m] = np.sqrt(alpha)
     return L_new, alpha
 
-def compute_delta_with_factor(Z, Q, s, S, ridge=1e-8, normalize: bool = False):
+def compute_delta_with_factor(Z, Q, s, S, normalize: bool = False):
     """
     Compute the optimal intervention delta for a fixed seed set S,
-    reusing a precomputed Cholesky factor of Z_SS.
+    reusing a precomputed Cholesky factor of Z_SS + ridge * I.
 
     Parameters
     ----------
     Z : (n, n) ndarray
         PSD matrix in the objective.
     Q : (|S|, |S|) ndarray
-        Lower-triangular Cholesky factor L with Z_SS = L @ L.T (same convention
-        as ``cholesky_add_node`` / ``solve_with_cholesky``), not a ``cho_factor`` tuple.
+        Lower-triangular Cholesky factor L with (Z_SS + ridge * I) = L @ L.T
+        (same convention as ``cholesky_add_node`` / ``solve_with_cholesky``).
 
     s : (n,) ndarray
         Opinion vector.
     S : list[int] or array-like
-        Selected seed set.
-    ridge : float
-        Small regularization for numerical stability.
+        Selected seed set in insertion order (must match Q).
 
     Returns
     -------
@@ -501,22 +504,17 @@ def compute_delta_with_factor(Z, Q, s, S, ridge=1e-8, normalize: bool = False):
         Nonzero coordinates on S.
     """
     n = Z.shape[0]
-    # Preserve insertion order: Q matches Z_SS in this row/column order, not sorted(S).
     S = np.asarray(S, dtype=int)
     bar = np.array([i for i in range(n) if i not in set(S.tolist())], dtype=int)
 
     if len(S) == 0:
         return np.zeros(n), np.array([])
 
-    ZSS = 0.5 * (Z[np.ix_(S, S)] + Z[np.ix_(S, S)].T)
-    ZSS = ZSS + ridge * np.eye(len(S))
-    
-
     ZSbar = Z[np.ix_(S, bar)]
     sbar = s[bar]
     rhs = ZSbar @ sbar
 
-    # delta_S* = - Z_SS^{-1} Z_Sbar s_bar
+    # delta_S* = - (Z_SS + ridge I)^{-1} Z_{S,bar} s_bar
     delta_S = -solve_with_cholesky(Q, rhs)
 
     if normalize:
@@ -536,18 +534,12 @@ def solve_with_cholesky(L, b):
     
 @dataclass
 class ScenarioOracle:
-    """
-    Fast oracle for one scenario:
-        F(S) = s^T P_S s,   P_S = Z_:S Z_SS^{-1} Z_S:
-    and
-        delta_S^* = - Z_SS^{-1} Z_Sbar s_bar.
-    """
     Z: np.ndarray
     s: np.ndarray
     ridge: float = 1e-8
 
     def __post_init__(self):
-        self.Z = project_psd(self.Z, eps=self.ridge)
+        self.Z = project_psd(self.Z, eps=1e-8)
         self.s = np.asarray(self.s, dtype=float).reshape(-1)
         ns = np.linalg.norm(self.s)
         if ns == 0:
@@ -563,31 +555,25 @@ class ScenarioOracle:
         ZSS = 0.5 * (ZSS + ZSS.T) + self.ridge * np.eye(len(idx))
         return idx, cho_factor(ZSS, lower=True, check_finite=False)
 
-    def benefit(self, S) -> float:
-        """
-        Exact fixed-set benefit F(S), computed stably.
-        """
-        key = tuple(sorted(S))
+    def benefit(self, S, nu: float = 2.0) -> float:
+        key = (tuple(sorted(S)), float(nu))
         if key in self._benefit_cache:
             return self._benefit_cache[key]
 
-        if len(key) == 0:
+        if len(key[0]) == 0:
             self._benefit_cache[key] = 0.0
             return 0.0
 
-        idx, cfac = self._factor(key)
-        # v = Z_{S,:} s
-        v = self.Z[np.ix_(idx, np.arange(self.Z.shape[0]))] @ self.s
+        idx, cfac = self._factor(key[0])
+        # v_S = Z_{S,:} s + nu * s_S
+        v = self.Z[np.ix_(idx, np.arange(self.Z.shape[0]))] @ self.s + nu * self.s[idx]
         x = cho_solve(cfac, v, check_finite=False)
         val = float(v @ x)
         val = max(val, 0.0)
         self._benefit_cache[key] = val
         return val
 
-    def delta(self, S):
-        """
-        Optimal fixed-set intervention delta_S^* padded to length n.
-        """
+    def delta(self, S, nu: float = 2.0):
         key = tuple(sorted(S))
         if key in self._delta_cache:
             return self._delta_cache[key]
@@ -602,7 +588,7 @@ class ScenarioOracle:
         idx, cfac = self._factor(key)
         bar = np.setdiff1d(np.arange(n), idx, assume_unique=False)
 
-        # delta_S^* = -Z_SS^{-1} Z_Sbar s_bar
+        # delta_S^* = -Z_SS^{-1} Z_{S,bar} s_bar  (nu does not affect the S x bar block)
         rhs = self.Z[np.ix_(idx, bar)] @ self.s[bar]
         delta_S = -cho_solve(cfac, rhs, check_finite=False)
 
@@ -617,6 +603,7 @@ def saturate_fast_helper(
     tol: float = 1e-6,
     max_outer: int = 50,
     max_budget: Optional[int] = None,
+    nu: float = 2.0,
 ) -> Tuple[List[int], float]:
     """
     Saturate over a finite set of scenarios, using fast benefit oracles.
@@ -636,8 +623,8 @@ def saturate_fast_helper(
     ground_set = list(ground_set)
     m = len(oracles)
 
-    def truncated_sum(S, c):
-        return sum(min(oracle.benefit(S), c) for oracle in oracles)
+    def truncated_sum(S, c, nu: float = 2.0):
+        return sum(min(oracle.benefit(S, nu=nu), c) for oracle in oracles)
 
     def greedy_cover(c):
         """
@@ -646,7 +633,7 @@ def saturate_fast_helper(
         """
         S: set[int] = set()
         S_order: List[int] = []
-        current = truncated_sum(S, c)
+        current = truncated_sum(S, c, nu=nu)
 
         while current < m * c - tol:
             if max_budget is not None and len(S) >= max_budget:
@@ -659,7 +646,7 @@ def saturate_fast_helper(
                 if u in S:
                     continue
                 cand = S | {u}
-                gain = truncated_sum(cand, c) - current
+                gain = truncated_sum(cand, c, nu=nu) - current
                 if gain > best_gain:
                     best_gain = gain
                     best_u = u
@@ -675,7 +662,7 @@ def saturate_fast_helper(
 
     # Safe upper bound: worst-case value on the full set
     full_S = set(ground_set)
-    hi = min(oracle.benefit(full_S) for oracle in oracles)
+    hi = min(oracle.benefit(full_S, nu=nu) for oracle in oracles)
     lo = 0.0
 
     best_S_order: List[int] = []
@@ -714,7 +701,6 @@ def generate_scenarios(Cbar: np.ndarray, rho: float, num_scenarios: int = 3) -> 
         Cs.append(project_psd(C))
 
     return Cs
-
 
 def sketch_solve(A, q=None, seed=None):
     rng = np.random.default_rng(seed)
