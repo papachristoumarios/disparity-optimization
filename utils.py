@@ -21,6 +21,13 @@ def get_datasets(args: argparse.Namespace):
     datasets = [('reddit', ['spectral']), 
                 ('twitter', ['spectral']), 
                 ('polblogs', ['spectral'])]
+    if args.size == 'large':
+        # add twitch datasets
+        datasets.extend([('twitch-DE', ['spectral']),
+                         ('twitch-ES', ['spectral']),
+                         ('twitch-FR', ['spectral']),
+                         ('twitch-PTBR', ['spectral']),
+                         ('twitch-RU', ['spectral'])])
     return datasets
 
 def load_weighted_undirected_graph(edge_file: str) -> nx.Graph:

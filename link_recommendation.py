@@ -1449,7 +1449,6 @@ def experiment_1_link_recommendation_oracle(args: argparse.Namespace):
                 df['Number of Sketch Vectors'] = q
                 df['Number of Nodes'] = G.number_of_nodes()
                 df['Batch Size'] = args.batch_size
-                df['Learning Rate'] = args.eta
                 df['Seed'] = args.seed
                 df['Time (s)'] = eta_time
                 df['Per Step Time (s)'] = eta_time / T_L
@@ -1531,7 +1530,6 @@ def experiment_2_link_recommendation_oracle(args: argparse.Namespace):
                     df['Number of Sketch Vectors'] = q
                     df['Number of Nodes'] = G.number_of_nodes()
                     df['Batch Size'] = args.batch_size
-                    df['Learning Rate'] = args.eta
                     df['Seed'] = args.seed
                     df['Time (s)'] = eta_time
                     df['Per Step Time (s)'] = eta_time / T_L
@@ -1976,7 +1974,6 @@ def experiment_5_fiedler_gradient_ascent(args: argparse.Namespace):
                 df["Number of Sketch Vectors"] = q
                 df["Number of Nodes"] = G.number_of_nodes()
                 df["Batch Size"] = args.batch_size
-                df["Learning Rate"] = args.eta
                 df["Seed"] = args.seed
                 df["Time (s)"] = eta_time
                 df["Per Step Time (s)"] = eta_time / T_L
@@ -2138,7 +2135,6 @@ def experiment_6_link_recommendation_baselines(args: argparse.Namespace) -> None
                     df["Number of Sketch Vectors"] = q
                     df["Number of Nodes"] = G.number_of_nodes()
                     df["Batch Size"] = args.batch_size
-                    df["Learning Rate"] = args.eta
                     df["Seed"] = args.seed
                     df["Time (s)"] = eta_time
                     df["Per Step Time (s)"] = eta_time / T_L
@@ -2257,7 +2253,6 @@ def experiment_7_fiedler_baselines(args: argparse.Namespace) -> None:
                     df["Number of Sketch Vectors"] = q
                     df["Number of Nodes"] = G.number_of_nodes()
                     df["Batch Size"] = args.batch_size
-                    df["Learning Rate"] = args.eta
                     df["Seed"] = args.seed
                     df["Time (s)"] = eta_time
                     df["Per Step Time (s)"] = eta_time / T_L
@@ -2535,7 +2530,6 @@ def experiment_9_predictive_model(args: argparse.Namespace) -> None:
                         df["Number of Sketch Vectors"] = q
                         df["Number of Nodes"] = G.number_of_nodes()
                         df["Batch Size"] = args.batch_size
-                        df["Learning Rate"] = args.eta
                         df["Seed"] = args.seed
                         df["Time (s)"] = eta_time
                         df["Per Step Time (s)"] = eta_time / steps

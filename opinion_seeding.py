@@ -13,12 +13,9 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
-
 import pandas as pd
 import argparse
 import os
-
-import cvxpy as cp
 
 from utils import *
 
@@ -48,7 +45,7 @@ sns.set_theme(
 FIGSIZE = 5.5
 
 OPINION_SEEDING_METHOD_LABELS: Dict[str, str] = {
-    "greedy": "Greedy (marginal gain)",
+    "greedy": "Greedy",
     "random": "Random",
     "max_degree": "Max degree",
     "pagerank": "PageRank",
