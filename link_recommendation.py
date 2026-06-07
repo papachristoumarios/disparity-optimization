@@ -332,13 +332,13 @@ def link_recommendation(
         initial_surrogate_disparity = s.T @ (X * C) @ s
         s_type = 'actual'
     else:
-        initial_disparity, _ = top_eigenpair(M * C)
-        initial_polarization, _ = top_eigenpair(M)
-        initial_surrogate_disparity, _ = top_eigenpair(X * C)
+        initial_disparity, s = top_eigenpair(M * C)
+        initial_polarization, s = top_eigenpair(M)
+        initial_surrogate_disparity, s = top_eigenpair(X * C)
         s_type = 'adversarial'
 
-    # import pdb; pdb.set_trace()
 
+    C_mtx = C * np.outer(s, s)
 
     initial_L0_fro = np.linalg.norm(L0, 'fro')
 
@@ -365,9 +365,11 @@ def link_recommendation(
         edges = random.sample(list(H.edges()), k=batch_size)
 
         cols = np.fromiter((edge_to_col[e] for e in edges), dtype=np.intp, count=len(edges))
-        T = B[:, cols]
-        coef = U.T @ T
-        leverage_arr = np.sum(coef * coef, axis=0)
+        Be = B[:, cols]
+        Xe = (X @ Be).T
+
+        leverage_arr = np.apply_along_axis(lambda x: x.T @ C_mtx @ x, axis=1, arr=Xe)
+
         idx_plus = int(np.argmax(leverage_arr))
         idx_minus = int(np.argmin(leverage_arr))
         edge_plus = edges[idx_plus]
