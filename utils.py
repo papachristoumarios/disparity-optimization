@@ -11,11 +11,36 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 from scipy.linalg import cho_factor, cho_solve, eigh, solve_triangular
 from tqdm import tqdm
+import seaborn as sns
 import time
 import argparse
 
 Array = np.ndarray
 Edge = Union[Tuple[int, int], Tuple[str, str]]
+
+FIGSIZE = 5.5
+
+
+def configure_plot_style() -> None:
+    """Apply the shared seaborn theme used by the experiment scripts."""
+    sns.set_theme(
+        style="whitegrid",
+        palette="magma",
+        context="paper",
+        font_scale=1.75,
+        rc={
+            "font.size": 15,
+            "axes.labelsize": 17,
+            "axes.titlesize": 18,
+            "xtick.labelsize": 15,
+            "ytick.labelsize": 15,
+            "legend.fontsize": 14,
+            "legend.title_fontsize": 15,
+            "figure.titlesize": 19,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        },
+    )
 
 def get_datasets(args: argparse.Namespace):
     datasets = [('reddit', ['spectral']), 
@@ -159,7 +184,6 @@ def load_dataset(name, group_type, return_labels: bool = False):
     G = largest_connected_component(G)
     
     nodes = sorted((str(v) for v in G.nodes()), key=lambda x: int(x) if x.isdigit() else x)
-    # set all edge weights to 1
 
     if group_type == 'spectral':
         labels = spectral_partition_labels(G, nodes).astype(np.float64)
@@ -173,7 +197,6 @@ def load_dataset(name, group_type, return_labels: bool = False):
     else:
         raise ValueError(f"Invalid group type: {group_type}")
 
-    # relabel nodes of G 
     G = nx.relabel_nodes(G, {n: i for i, n in enumerate(nodes)})
     
     Cbar = corr_from_labels(labels, rho=0.0)
@@ -245,31 +268,46 @@ def edge_inter_intra_bucket(u: int, v: int, Cbar: Array) -> str:
         return "inter"
     return "intra"
 
-def top_eigenpair(A, tol=1e-6, max_iter=200):
+def top_eigenpair(A, tol=1e-7, max_iter=500):
     """
-    Largest eigenpair of (approximately) symmetric A.
+    Largest algebraic eigenpair of symmetric A via power iteration.
 
-    Uses dense ``eigh`` for moderate n so the value is deterministic and not cut off
-    by a spurious power-iteration stop when ``lam_old`` was initialized to 0 and
-    ``|lambda_max| < tol``.
+    For PSD inputs (the usual case, since Hadamard products of PSD matrices are PSD)
+    this coincides with the largest-magnitude eigenvalue. If the dominant eigenvalue
+    is negative, A is shifted by its magnitude and re-iterated. ``eigsh(which='LA')``
+    is avoided since Lanczos converges slowly for the largest-algebraic eigenvalue of
+    an indefinite matrix.
     """
+    if sp.issparse(A):
+        A = A.toarray()
+    A = np.asarray(A, dtype=np.float64)
+    A = 0.5 * (A + A.T)
     n = A.shape[0]
-   
-    v = np.ones(n, dtype=np.float64)
-    v /= np.linalg.norm(v)
-    lam_old: Optional[float] = None
-    lam = 0.0
-    for _ in range(max_iter):
-        w = A @ v
-        norm_w = float(np.linalg.norm(w))
-        if norm_w == 0.0:
-            return float(lam), v
-        v = w / norm_w
-        lam = float(v @ (A @ v))
-        if lam_old is not None and abs(lam - lam_old) < tol:
-            break
-        lam_old = lam
-    return lam, v
+
+    def power(B):
+        v = np.ones(n, dtype=np.float64)
+        v /= np.linalg.norm(v)
+        lam = 0.0
+        lam_old: Optional[float] = None
+        for _ in range(max_iter):
+            w = B @ v
+            norm_w = float(np.linalg.norm(w))
+            if norm_w == 0.0:
+                return 0.0, v
+            v = w / norm_w
+            lam = float(v @ (B @ v))
+            if lam_old is not None and abs(lam - lam_old) <= tol * (abs(lam_old) + 1e-14):
+                break
+            lam_old = lam
+        return lam, v
+
+    lam, v = power(A)
+    if lam >= 0.0:
+        return lam, v
+    # dominant eigenvalue negative: shift so the algebraic max becomes dominant
+    shift = -lam
+    lam2, v2 = power(A + shift * np.eye(n))
+    return lam2 - shift, v2
 
 def project_psd(A: np.ndarray, eps: Optional[float] = None) -> np.ndarray:
     """
@@ -294,10 +332,59 @@ def enforce_unit_diagonal(C):
     return C
 
 def project_box_constraint(C: np.ndarray, Cbar: np.ndarray, limit: float = 1.0) -> np.ndarray:
-    # project non diagonal elements of C onto the box [-rho, rho]
+    # clip C - Cbar onto the box [-limit, limit]
     M = C - Cbar
     M = np.clip(M, -limit, limit)
     return Cbar + M
+
+
+def project_box_unit_diagonal(C: np.ndarray, Cbar: np.ndarray, limit: float = 1.0) -> np.ndarray:
+    """Project onto {||C - Cbar||_inf <= limit off-diagonal} ∩ {unit diagonal}."""
+    out = project_box_constraint(C, Cbar, limit)
+    np.fill_diagonal(out, 1.0)
+    return out
+
+
+def project_box_psd_correlation(
+    C: np.ndarray,
+    Cbar: np.ndarray,
+    limit: float = 1.0,
+    n_iters: int = 20,
+    tol: float = 1e-6,
+) -> np.ndarray:
+    """Dykstra projection onto {box around Cbar} ∩ {PSD} ∩ {unit diagonal}.
+
+    A one-shot box/PSD/box projection or plain alternating projection (POCS) does not
+    converge to a feasible correlation matrix; Dykstra's per-set correction terms yield
+    the true projection onto the intersection. The input ``C`` should be near-feasible.
+    """
+    X = 0.5 * (C + C.T)
+    p_box = np.zeros_like(X)
+    p_diag = np.zeros_like(X)
+    p_psd = np.zeros_like(X)
+    for _ in range(n_iters):
+        X_prev = X
+
+        # box around Cbar
+        y = X + p_box
+        y_box = project_box_constraint(y, Cbar, limit)
+        p_box = y - y_box
+
+        # unit-diagonal affine set
+        z = y_box + p_diag
+        z_diag = z.copy()
+        np.fill_diagonal(z_diag, 1.0)
+        p_diag = z - z_diag
+
+        # PSD cone
+        w = z_diag + p_psd
+        w_psd = project_psd(w)
+        p_psd = w - w_psd
+
+        X = w_psd
+        if np.linalg.norm(X - X_prev) <= tol * (np.linalg.norm(X_prev) + 1e-14):
+            break
+    return X
 
 
 def project_to_correlation(A: np.ndarray, n_iters: int = 20, eps: float = 1e-10) -> np.ndarray:
@@ -321,8 +408,14 @@ def worst_case_C_for_fixed_L(
     rho: float,
     C_prev: Optional[np.ndarray] = None,
     s: Optional[np.ndarray] = None,
-    n_steps: int = 5,
+    n_steps: int = 10,
 ) -> Tuple[np.ndarray, float]:
+    """Worst-case correlation matrix maximizing the top eigenvalue of ``X ∘ C`` over
+    the uncertainty set ``U = {C ⪰ 0, diag(C) = 1, ||C - Cbar||_inf <= 4*rho*(1-rho)}``.
+
+    Uses projected-gradient ascent with modest steps, keeping each iterate near-feasible
+    so the Dykstra projection returns a genuine correlation matrix in the box.
+    """
     n = L.shape[0]
     q = 4 * rho * (1 - rho)
     start_time = time.time()
@@ -332,44 +425,39 @@ def worst_case_C_for_fixed_L(
     else:
         C = C_prev.copy()
 
+    # start from a feasible (PSD, unit-diagonal, in-box) point
+    C = project_box_psd_correlation(C, Cbar, q)
 
     if s is not None:
         v = s.copy()
-        lam = s.T @ (X * C) @ s
+        lam = float(s.T @ (X * C) @ s)
     else:
         lam, v = top_eigenpair(X * C)
-
         v = v.copy()
-
-    C_init = C.copy()
 
     lam_prev = lam
 
     for step in range(n_steps):
-        # Frank-Wolfe: move toward extreme point of box in gradient direction
-        G = X * np.outer(v, v)       # gradient w.r.t. C
-        C = C + q * np.sign(G)       # full step to box extreme point
-        
-        # Project back onto U
-        C = project_box_constraint(C, Cbar, q)
-        C = project_psd(C)
-        C = project_box_constraint(C, Cbar, q)  # re-enforce after PSD
-        C = enforce_unit_diagonal(C)
+        # gradient of lambda_max(X ∘ C) is X ∘ (v v^T)
+        G = X * np.outer(v, v)
+        # scale so the largest coordinate moves by ~q, keeping the iterate near-feasible
+        alpha = q / (np.abs(G).max() + 1e-14)
+        C = project_box_psd_correlation(C + alpha * G, Cbar, q)
 
-        # Recompute eigenpair at new C
+        # Recompute eigenpair at new C (v fixed to s in the supplied-s branch)
         if s is not None:
-            lam = s.T @ (X * C) @ s
+            lam = float(s.T @ (X * C) @ s)
         else:
             lam, v = top_eigenpair(X * C)
+            v = v.copy()
 
-
-        if np.isclose(lam, lam_prev, rtol=1e-10):
+        if abs(lam - lam_prev) <= 1e-10 * (abs(lam_prev) + 1e-14):
             break
 
         lam_prev = lam
 
     eta_time = time.time() - start_time
-    
+
     return C, eta_time
 
 
@@ -395,8 +483,7 @@ def sketch_U_sherman_morrison_two_rank(
     u_vec = np.sqrt(w) * np.asarray(a, dtype=np.float64).ravel()
     z_vec = np.sqrt(w) * np.asarray(c, dtype=np.float64).ravel()
 
-    # --- Step 1: First Rank-1 Update (Adding u_vec) ---
-    # Approximate X @ u_vec using (U @ R.T @ u) / q
+    # rank-1 update adding u_vec
     Xu = (U @ (R.T @ u_vec)) / q
     t_u = U.T @ u_vec
 
@@ -406,14 +493,11 @@ def sketch_U_sherman_morrison_two_rank(
             math.copysign(denom_eps, denom1) if denom1 != 0.0 else denom_eps
         )
 
-    # Compute intermediate U1 after the first rank-1 update
     U1 = U - np.outer(Xu, t_u) / denom1
 
-    # --- Step 2: Second Rank-1 Update (Subtracting z_vec) ---
-    # Approximate X @ z_vec on the original matrix
+    # rank-1 update subtracting z_vec
     Xz = (U @ (R.T @ z_vec)) / q
 
-    # Apply Sherman-Morrison to find X1_z (the action of intermediate X1 on z_vec)
     X1_z = Xz - Xu * float(u_vec @ Xz) / denom1
 
     denom2 = 1.0 - float(z_vec @ X1_z)
@@ -422,7 +506,6 @@ def sketch_U_sherman_morrison_two_rank(
             math.copysign(denom_eps, denom2) if denom2 != 0.0 else denom_eps
         )
 
-    # Compute final updated U matrix
     g = U1.T @ z_vec
     U = U1 + np.outer(X1_z, g) / denom2
     X = (U @ R.T) / q
@@ -556,7 +639,7 @@ class ScenarioOracle:
         self._benefit_cache = {}
         self._delta_cache = {}
 
-    def _factor(self, S):
+    def factor(self, S):
         idx = np.asarray(tuple(sorted(S)), dtype=np.intp)
         ZSS = self.Z[np.ix_(idx, idx)]
         ZSS = 0.5 * (ZSS + ZSS.T) + self.ridge * np.eye(len(idx))
@@ -571,7 +654,7 @@ class ScenarioOracle:
             self._benefit_cache[key] = 0.0
             return 0.0
 
-        idx, cfac = self._factor(key[0])
+        idx, cfac = self.factor(key[0])
         # v_S = Z_{S,:} s + nu * s_S
         v = self.Z[np.ix_(idx, np.arange(self.Z.shape[0]))] @ self.s + nu * self.s[idx]
         x = cho_solve(cfac, v, check_finite=False)
@@ -592,7 +675,7 @@ class ScenarioOracle:
             self._delta_cache[key] = (delta, np.array([], dtype=float))
             return delta, np.array([], dtype=float)
 
-        idx, cfac = self._factor(key)
+        idx, cfac = self.factor(key)
         bar = np.setdiff1d(np.arange(n), idx, assume_unique=False)
 
         # delta_S^* = -Z_SS^{-1} Z_{S,bar} s_bar  (nu does not affect the S x bar block)
@@ -713,10 +796,8 @@ def sketch_solve(A, q=None, seed=None):
     rng = np.random.default_rng(seed)
     n = A.shape[0]
 
-    # Rademacher sketch matrix R
     R = rng.choice([-1.0, 1.0], size=(n, q))
 
-    # Sketch for X = A^{-1}: solve A U_X = R
     U = sketch_solve_helper(A, R)         # shape (n, q)
 
     X = (U @ R.T) / q

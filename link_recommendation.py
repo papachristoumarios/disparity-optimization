@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import random
-from re import S
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
@@ -16,33 +15,13 @@ import time
 from tqdm import tqdm
 from utils import *
 import os
-rng = np.random.default_rng(0)
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 
-sns.set_theme(
-    style="whitegrid",
-    palette="magma",
-    context="paper",
-    font_scale=1.75,
-    rc={
-        "font.size": 15,
-        "axes.labelsize": 17,
-        "axes.titlesize": 18,
-        "xtick.labelsize": 15,
-        "ytick.labelsize": 15,
-        "legend.fontsize": 14,
-        "legend.title_fontsize": 15,
-        "figure.titlesize": 19,
-        "pdf.fonttype": 42,
-        "ps.fonttype": 42,
-    },
-)
-
-FIGSIZE = 5.5
+configure_plot_style()
 
 
-def _pct_change_vs_ref(curr: float, ref: float) -> float:
+def pct_change_vs_ref(curr: float, ref: float) -> float:
     if not np.isfinite(curr):
         return 0.0
     if not np.isfinite(ref) or abs(ref) < 1e-20:
@@ -50,7 +29,7 @@ def _pct_change_vs_ref(curr: float, ref: float) -> float:
     return float((curr - ref) / (abs(ref) + 1e-14) * 100.0)
 
 
-def _append_auxiliary_inner_records(
+def append_auxiliary_inner_records(
     records: List[dict],
     i: int,
     M: np.ndarray,
@@ -71,7 +50,7 @@ def _append_auxiliary_inner_records(
         {
             "Step": i,
             "Metric": "Mean M cross-group",
-            "Percent Change": _pct_change_vs_ref(mc, init_mean_cross),
+            "Percent Change": pct_change_vs_ref(mc, init_mean_cross),
             "Value": mc,
         }
     )
@@ -79,7 +58,7 @@ def _append_auxiliary_inner_records(
         {
             "Step": i,
             "Metric": "Mean M within-group",
-            "Percent Change": _pct_change_vs_ref(mw, init_mean_within),
+            "Percent Change": pct_change_vs_ref(mw, init_mean_within),
             "Value": mw,
         }
     )
@@ -359,9 +338,7 @@ def link_recommendation(
     intra_abs_cum = 0.0
     inter_abs_cum = 0.0
 
-    # use tqdm to show progress
     for i in range(T_L):
-        # pick one edge
         edges = random.sample(list(H.edges()), k=batch_size)
 
         cols = np.fromiter((edge_to_col[e] for e in edges), dtype=np.intp, count=len(edges))
@@ -428,7 +405,6 @@ def link_recommendation(
             disparity, _ = top_eigenpair(Z)
             polarization, _ = top_eigenpair(M)
 
-        # if convergence is detected, break
         if np.isclose(surrogate_disparity, surrogate_disparity_prev, rtol=1e-6):
             break
         
@@ -456,7 +432,7 @@ def link_recommendation(
             'Percent Change': diff_L_fro,
         })
 
-        _append_auxiliary_inner_records(
+        append_auxiliary_inner_records(
             records,
             i,
             M,
@@ -486,7 +462,7 @@ def link_recommendation(
     return df, L, X, M, H, eta_time
 
 
-def _laplacian_edge_weight_delta(n: int, u: int, v: int, delta_w: float) -> sp.csr_matrix:
+def laplacian_edge_weight_delta(n: int, u: int, v: int, delta_w: float) -> sp.csr_matrix:
     """Sparse rank-one update delta_w * (e_u - e_v)(e_u - e_v)^T for the Laplacian."""
     rows = np.array([u, u, v, v], dtype=np.int32)
     cols = np.array([u, v, u, v], dtype=np.int32)
@@ -495,10 +471,8 @@ def _laplacian_edge_weight_delta(n: int, u: int, v: int, delta_w: float) -> sp.c
 
 
 def algebraic_connectivity_and_fiedler_vector(L: sp.csr_matrix) -> Tuple[float, np.ndarray]:
-    """
-    Second smallest eigenvalue of L (algebraic connectivity) and a corresponding unit eigenvector.
-    For a connected graph this is the Fiedler value / Fiedler vector pair.
-    """
+    """Algebraic connectivity (second smallest eigenvalue of L) and a corresponding unit
+    eigenvector; the Fiedler value/vector pair for a connected graph."""
     n = L.shape[0]
     L64 = L.astype(np.float64)
     if n <= 1:
@@ -526,11 +500,9 @@ def fiedler_maximizing_link_recommendation(
     eta: float = 1,
     seed: int = 0,
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, nx.Graph, float]:
-    """
-    Gradient ascent on edge weights: at each step, move mass from an edge with smallest
-    (v_u - v_v)^2 to one with largest, where v is the Fiedler vector of L. This follows
-    the partial derivative dλ_2/d w_e = (v_u - v_v)^2 for the algebraic connectivity λ_2.
-    """
+    """Gradient ascent on edge weights for algebraic connectivity λ_2. Each step moves mass
+    from the edge with smallest (v_u - v_v)^2 to the largest, where v is the Fiedler vector of L
+    and dλ_2/dw_e = (v_u - v_v)^2."""
     nodelist = list(G.nodes())
     B = nx.incidence_matrix(G, nodelist=nodelist, oriented=True).toarray()
     edge_to_col = {}
@@ -607,8 +579,8 @@ def fiedler_maximizing_link_recommendation(
 
         u_p, v_p = int(edge_plus[0]), int(edge_plus[1])
         u_m, v_m = int(edge_minus[0]), int(edge_minus[1])
-        L = L + _laplacian_edge_weight_delta(n, u_p, v_p, weight_change)
-        L = L + _laplacian_edge_weight_delta(n, u_m, v_m, -weight_change)
+        L = L + laplacian_edge_weight_delta(n, u_p, v_p, weight_change)
+        L = L + laplacian_edge_weight_delta(n, u_m, v_m, -weight_change)
         L.eliminate_zeros()
 
         if (i + 1) % T_refresh == 0:
@@ -693,12 +665,12 @@ METHOD_LABELS: Dict[str, str] = {
 }
 
 
-def _edge_betweenness_unweighted(H: nx.Graph) -> Dict[Tuple[int, int], float]:
+def edge_betweenness_unweighted(H: nx.Graph) -> Dict[Tuple[int, int], float]:
     """Undirected edge betweenness (topology only; ignores weights)."""
     return nx.edge_betweenness_centrality(H, normalized=False)
 
 
-def _select_edges_for_transfer(
+def select_edges_for_transfer(
     selection: str,
     edges: List[Tuple],
     H: nx.Graph,
@@ -751,7 +723,7 @@ def _select_edges_for_transfer(
 
     if selection == "max_betweenness":
         if betweenness_scores is None:
-            betweenness_scores = _edge_betweenness_unweighted(H)
+            betweenness_scores = edge_betweenness_unweighted(H)
 
         def edge_bc(e: Tuple) -> float:
             u, v = int(e[0]), int(e[1])
@@ -783,16 +755,14 @@ def generalized_link_reweighting(
     betweenness_refresh: int = 1,
     Cbar_for_groups: Optional[np.ndarray] = None,
 ) -> Tuple[pd.DataFrame, sp.csr_matrix, np.ndarray, np.ndarray, nx.Graph, float]:
-    """
-    Same mass-transfer dynamics as ``link_recommendation`` / ``fiedler_maximizing_link_recommendation``,
-    with edge choice controlled by ``selection``:
+    """Mass-transfer dynamics shared with ``link_recommendation`` and
+    ``fiedler_maximizing_link_recommendation``, with the edge pair chosen by ``selection``:
 
-    - ``leverage``: disparity-oracle (original link recommendation)
+    - ``leverage``: disparity oracle (original link recommendation)
     - ``fiedler_grad``: Fiedler-value gradient scores
     - ``random``: uniform random pair from the batch
-    - ``max_degree``: move weight toward higher-degree endpoints
-    - ``max_betweenness``: move weight toward higher edge-betweenness (topology); refresh cadence via
-      ``betweenness_refresh``
+    - ``max_degree``: higher-degree endpoints
+    - ``max_betweenness``: higher edge-betweenness (topology), refreshed every ``betweenness_refresh`` steps
     """
     if selection not in METHOD_LABELS:
         raise ValueError(f"selection must be one of {list(METHOD_LABELS)}")
@@ -869,11 +839,11 @@ def generalized_link_reweighting(
 
         if selection == "max_betweenness":
             if betweenness_cache is None or (i % betweenness_refresh == 0):
-                betweenness_cache = _edge_betweenness_unweighted(H)
+                betweenness_cache = edge_betweenness_unweighted(H)
         else:
             betweenness_cache = None
 
-        edge_plus, edge_minus = _select_edges_for_transfer(
+        edge_plus, edge_minus = select_edges_for_transfer(
             selection,
             edges,
             H,
@@ -924,8 +894,8 @@ def generalized_link_reweighting(
 
         u_p, v_p = int(edge_plus[0]), int(edge_plus[1])
         u_m, v_m = int(edge_minus[0]), int(edge_minus[1])
-        L = L + _laplacian_edge_weight_delta(n, u_p, v_p, weight_change)
-        L = L + _laplacian_edge_weight_delta(n, u_m, v_m, -weight_change)
+        L = L + laplacian_edge_weight_delta(n, u_p, v_p, weight_change)
+        L = L + laplacian_edge_weight_delta(n, u_m, v_m, -weight_change)
         L.eliminate_zeros()
 
         if (i + 1) % T_refresh == 0:
@@ -1029,7 +999,7 @@ def generalized_link_reweighting(
             }
         )
 
-        _append_auxiliary_inner_records(
+        append_auxiliary_inner_records(
             records,
             i,
             M,
@@ -1308,7 +1278,7 @@ _EXPERIMENT_4_OUTER_C_DEV_METRICS = frozenset(
 )
 
 
-def _experiment_4_forward_fill_meta(df: pd.DataFrame) -> pd.DataFrame:
+def experiment_4_forward_fill_meta(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for col in ['Name', 'Rho', 'Norm Constraint', 'Number of Nodes', 'Time (s)', 'Per Step Time (s)']:
         if col in out.columns:
@@ -1316,7 +1286,7 @@ def _experiment_4_forward_fill_meta(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _experiment_4_inner_last_run_for_metrics(df: pd.DataFrame, inner_metrics: frozenset) -> pd.DataFrame:
+def experiment_4_inner_last_run_for_metrics(df: pd.DataFrame, inner_metrics: frozenset) -> pd.DataFrame:
     """Keep only the final outer-iteration inner trajectory per (Name, Rho) for the given metrics."""
     d = df[df["Metric"].isin(inner_metrics)].copy()
     if d.empty:
@@ -1334,9 +1304,9 @@ def _experiment_4_inner_last_run_for_metrics(df: pd.DataFrame, inner_metrics: fr
     return pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame()
 
 
-def _experiment_4_inner_last_run(df: pd.DataFrame) -> pd.DataFrame:
+def experiment_4_inner_last_run(df: pd.DataFrame) -> pd.DataFrame:
     """Keep only the final outer-iteration inner trajectory per (Name, Rho)."""
-    return _experiment_4_inner_last_run_for_metrics(
+    return experiment_4_inner_last_run_for_metrics(
         df,
         frozenset({"Surrogate", "Disparity", "Polarization", _FROBENIUS_METRIC_LABEL}),
     )
@@ -1359,7 +1329,6 @@ def experiment_0_network_statistics(args: argparse.Namespace):
             d_avg = np.mean(d)
             d_max = np.max(d)
 
-            # fiedler value
             L = sparse_laplacian(G)
             eigenvalues, _ = spla.eigsh(L, k=2, which="SA")
             fiedler_value = eigenvalues[1]
@@ -1396,8 +1365,7 @@ def experiment_0_network_statistics(args: argparse.Namespace):
     n = df['# Nodes'].max()
     lambda_2_range = np.arange(0, 1, 0.01)
     rho_range = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5])
-    
-    # define a function
+
     def lb(x, y):
         return (1 - 2 * y)**2 * (1 + x)**2
 
@@ -1420,7 +1388,6 @@ def experiment_0_network_statistics(args: argparse.Namespace):
     ax.set_ylabel('Classifier error probability ($\\rho$)')
     ax.set_title('Ratio Lower Bound')
     sns.despine(fig)
-    # fig.tight_layout()
     fig.savefig(f'{out_dir}/experiment_0_network_statistics_lower_bound.pdf', dpi=300, bbox_inches='tight')
 
     df.to_latex(f'{out_dir}/experiment_0_network_statistics.tex', index=False, float_format='%.2f')
@@ -1481,7 +1448,6 @@ def experiment_1_link_recommendation_oracle(args: argparse.Namespace):
         ax_c[0, i].set_title(name)
 
 
-    # sort concat_df by Number of Nodes
     concat_df = concat_df.sort_values(by='Number of Nodes')
 
     sns.barplot(x='Name', y='Time (s)', data=concat_df, ax=ax_a[0, -1], legend=True, dodge=True)
@@ -1752,8 +1718,8 @@ def experiment_4_robust_link_recommendation_oracle(args: argparse.Namespace):
         concat_df = concat_df[np.isfinite(concat_df['Percent Change'])].copy()
         df_opinions = pd.DataFrame(df_opinions)
 
-    plot_df = _experiment_4_forward_fill_meta(concat_df)
-    df_inner_last = _experiment_4_inner_last_run(plot_df)
+    plot_df = experiment_4_forward_fill_meta(concat_df)
+    df_inner_last = experiment_4_inner_last_run(plot_df)
     if df_inner_last.empty:
         concat_df.to_csv(f'{out_dir}/experiment_4_robust_link_recommendation_oracle.csv', index=False)
         return
@@ -1783,7 +1749,6 @@ def experiment_4_robust_link_recommendation_oracle(args: argparse.Namespace):
         df_name = plot_df[plot_df['Name'] == name].copy()
         sns.barplot(x='Rho', y='Percent Change', hue='Metric', data=df_bar[(df_bar['Name'] == name) & (df_bar['Metric'].isin(['Surrogate', 'Disparity']))], ax=ax_a[0, i], dodge=True, legend=(i == num_names - 1))
         ax_a[0, i].set_title(name)
-        # ax_a[0, i].set_ylim(min_percent_change, max_percent_change)
 
         df_time = df_name.drop_duplicates(subset=['Rho'], keep='first')
         sns.barplot(x='Rho', y='Per Step Time (s)', data=df_time, ax=ax_c[0, i], dodge=True, legend=(i == num_names - 1))
@@ -1827,8 +1792,8 @@ def experiment_4_robust_link_recommendation_oracle(args: argparse.Namespace):
     fig_c.tight_layout()
     fig_c.savefig(f'{out_dir}/experiment_4c_robust_link_recommendation_oracle.pdf', dpi=300, bbox_inches='tight')
 
-    # --- Auxiliary inner metrics: last inner step of final outer iteration (bar by rho) ---
-    df_aux_last = _experiment_4_inner_last_run_for_metrics(plot_df, _EXPERIMENT_4_AUX_INNER_METRICS)
+    # Auxiliary inner metrics
+    df_aux_last = experiment_4_inner_last_run_for_metrics(plot_df, _EXPERIMENT_4_AUX_INNER_METRICS)
     if not df_aux_last.empty:
         idx_max_aux = df_aux_last.groupby(["Name", "Rho"])["Step"].transform("max")
         df_aux_bar = df_aux_last[df_aux_last["Step"] == idx_max_aux].copy()
@@ -1858,8 +1823,7 @@ def experiment_4_robust_link_recommendation_oracle(args: argparse.Namespace):
         
 
         fig_d.tight_layout()
-        
-        # move legend to the outside of the plot
+
         ax_d[0, i].legend(loc='upper left', bbox_to_anchor=(1, 1))
 
         fig_d.savefig(
@@ -1869,7 +1833,7 @@ def experiment_4_robust_link_recommendation_oracle(args: argparse.Namespace):
         )
         plt.close(fig_d)
 
-    # --- Outer-loop $C$ deviation from $\bar C$: final outer iteration (bar by rho) ---
+    # Outer-loop C deviation from Cbar
     df_c_dev = plot_df[plot_df["Metric"].isin(_EXPERIMENT_4_OUTER_C_DEV_METRICS)].dropna(subset=["k"])
     if not df_c_dev.empty:
         idx_max_k = df_c_dev.groupby(["Name", "Rho", "Metric"])["k"].transform("max")
@@ -1900,8 +1864,7 @@ def experiment_4_robust_link_recommendation_oracle(args: argparse.Namespace):
                 ax_e[0, i].set_ylabel(r"$\|C_{{new}} - \bar C\|$")
             else:
                 ax_e[0, i].set_ylabel('')
-        
-        # move legend to the outside of the plot
+
         if i == num_names - 1:
             ax_e[0, i].legend(loc='upper left', bbox_to_anchor=(1, 1))
         fig_e.tight_layout()
@@ -1912,7 +1875,7 @@ def experiment_4_robust_link_recommendation_oracle(args: argparse.Namespace):
         )
         plt.close(fig_e)
 
-    # lineplot of final opinion change by node id for each name hue by rho
+    # Final opinion change by node id
     fig_f, ax_f = plt.subplots(nrows=1, ncols=(1 + num_names), figsize=(FIGSIZE * (1 + num_names), FIGSIZE), squeeze=False)
     for i, name in enumerate(name_list):
         df_name = df_opinions[df_opinions["Name"] == name].copy()
@@ -1940,10 +1903,8 @@ def experiment_4_robust_link_recommendation_oracle(args: argparse.Namespace):
 
 
 def experiment_5_fiedler_gradient_ascent(args: argparse.Namespace):
-    """
-    Same layout as experiment 1, but edge updates follow gradient ascent on algebraic
-    connectivity (Fiedler value λ_2 of L).
-    """
+    """Experiment 1 layout, with edge updates following gradient ascent on algebraic
+    connectivity (Fiedler value λ_2 of L)."""
     out_dir = args.out_dir
 
     datasets = get_datasets(args)
@@ -2153,7 +2114,6 @@ def experiment_6_link_recommendation_baselines(args: argparse.Namespace) -> None
     metrics = ["Surrogate", "Disparity", "Polarization"]
     df_bar = df_last[df_last["Metric"].isin(metrics)].copy()
 
-    # format as the other catplot
     df_bar["Method"] = df_bar["Method"].replace({
         "Random rewiring": "Random",
         "Max-degree heuristic": "Degree",
@@ -2268,11 +2228,9 @@ def experiment_7_fiedler_baselines(args: argparse.Namespace) -> None:
 
     step_max = df_all["Step"].max()
     df_last = df_all[df_all["Step"] == step_max].copy()
-    # metrics = [r"Fiedler $\lambda_2$", "Surrogate", "Disparity", "Polarization"]
     metrics = ["Surrogate", "Disparity", "Polarization"]
     df_bar = df_last[df_last["Metric"].isin(metrics)].copy()
 
-    # rename methods to shorter names
     df_bar["Method"] = df_bar["Method"].replace({
         "Random rewiring": "Random",
         "Max-degree heuristic": "Degree",
@@ -2401,7 +2359,6 @@ def experiment_8_robust_link_recommendation_baselines(args: argparse.Namespace) 
     if len(df_outer) == 0:
         return
 
-    # remove worst polarization metric
     df_outer = df_outer[df_outer["Metric"] != "Worst Polarization"]
 
     df_outer = df_outer[df_outer["Nominal Partition Type"].isin(set(df_outer["Nominal Partition Type"].unique()) - {"polarization"})].copy()
@@ -2416,7 +2373,7 @@ def experiment_8_robust_link_recommendation_baselines(args: argparse.Namespace) 
         kind="line",
         markers=True,
         dashes=False,
-        facet_kws={"sharey": True},
+        facet_kws={"sharey": False},
     )
     g.set_titles(template="{col_name}")
     g.figure.suptitle("Comparison with baselines")
@@ -2603,7 +2560,6 @@ def experiment_9_predictive_model(args: argparse.Namespace) -> None:
         )
         ax_a[0, i].set_title(name)
         ax_a[0, i].set_xlabel("Fraction of training data")
-        # ax_a[0, i].set_ylim(min_percent_change, max_percent_change)
 
         df_time = plot_df[plot_df["Name"] == name].drop_duplicates(
             subset=["Fraction of Training Data"],

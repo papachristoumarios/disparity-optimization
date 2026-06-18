@@ -12,11 +12,6 @@ conda activate disparity-optimization
 pip install -r requirements.txt
 ```
 
-
-```bash
-pip install karateclub
-```
-
 ## Data
 
 Graphs and opinions live under `data/`. Each dataset directory needs:
@@ -98,7 +93,7 @@ Both drivers accept:
 bash scripts/run_all_experiments.sh
 ```
 
-To run one batch job manually (after loading your environment):
+To run one batch job manually:
 
 ```bash
 mkdir -p logs figures

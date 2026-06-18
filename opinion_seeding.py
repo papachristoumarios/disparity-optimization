@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-import dataclasses
-import itertools
-import math
-from sys import setrecursionlimit
 import time
-import random
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import networkx as nx
@@ -21,28 +16,8 @@ from utils import *
 
 import seaborn as sns
 import matplotlib.pyplot as plt
-from dataclasses import dataclass
 
-sns.set_theme(
-    style="whitegrid",
-    palette="magma",
-    context="paper",
-    font_scale=1.75,
-    rc={
-        "font.size": 15,
-        "axes.labelsize": 17,
-        "axes.titlesize": 18,
-        "xtick.labelsize": 15,
-        "ytick.labelsize": 15,
-        "legend.fontsize": 14,
-        "legend.title_fontsize": 15,
-        "figure.titlesize": 19,
-        "pdf.fonttype": 42,
-        "ps.fonttype": 42,
-    },
-)
-
-FIGSIZE = 5.5
+configure_plot_style()
 
 OPINION_SEEDING_METHOD_LABELS: Dict[str, str] = {
     "greedy": "Greedy",
@@ -114,7 +89,7 @@ def benefit_fixed_set(Z: np.ndarray, s: np.ndarray, S: Sequence[int], ridge: flo
     return max(float(v @ x), 0.0)
 
 
-def _baseline_node_order(G: nx.Graph, selection: str, seed: int) -> List[int]:
+def baseline_node_order(G: nx.Graph, selection: str, seed: int) -> List[int]:
     """Fixed seeding order for non-greedy baselines (nodes are 0..n-1)."""
     n = G.number_of_nodes()
     if selection == "max_degree":
@@ -130,7 +105,7 @@ def _baseline_node_order(G: nx.Graph, selection: str, seed: int) -> List[int]:
     raise ValueError(f"Unknown baseline selection: {selection}")
 
 
-def _append_seeded_node(
+def append_seeded_node(
     Z: np.ndarray,
     Q: Optional[np.ndarray],
     s: np.ndarray,
@@ -138,7 +113,7 @@ def _append_seeded_node(
     bu: int,
     ridge: float = 0.0,
 ) -> Tuple[Optional[np.ndarray], float, np.ndarray, np.ndarray]:
-    """Add node ``bu`` to ``S``, update Cholesky ``Q``, return gain and intervention."""
+    """Add node ``bu`` to ``S``, update the Cholesky factor ``Q``, and return the gain and intervention."""
     S_idx = np.asarray(S, dtype=np.intp)
     gain, z_col, alpha = marginal_gain_for_node(Z, Q, s, S_idx, int(bu), ridge=ridge)
 
@@ -196,7 +171,7 @@ def opinion_seeding_fast(
 
     baseline_order: Optional[List[int]] = None
     if selection != "greedy":
-        baseline_order = _baseline_node_order(G, selection, seed)
+        baseline_order = baseline_node_order(G, selection, seed)
 
     start_time = time.time()
 
@@ -232,7 +207,7 @@ def opinion_seeding_fast(
                 Z, Q, s, S_idx, bu, ridge=ridge
             )
 
-        Q, step_gain, delta, delta_S = _append_seeded_node(
+        Q, step_gain, delta, delta_S = append_seeded_node(
             Z, Q, s, S, bu, ridge=ridge
         )
         remaining.remove(bu)
@@ -306,7 +281,7 @@ def robust_opinion_seeding_fast(
     initial_objective_value: Optional[float] = None
 
     for i, bu in enumerate(S_ordered[:b]):
-        Q, _, delta, delta_S = _append_seeded_node(
+        Q, _, delta, delta_S = append_seeded_node(
             Z_nom, Q, s, S, int(bu), ridge=ridge
         )
         objective_value = min(
@@ -589,7 +564,6 @@ def experiment_1_opinion_seeding_oracle(args: argparse.Namespace) -> None:
         df_delta = pd.DataFrame(df_delta)
         df_delta.to_csv(f'{out_dir}/experiment_1_opinion_seeding_oracle_delta.csv', index=False)
 
-    # plot percent change in benefit
     num_names = concat_df['Name'].nunique()
     fig_a, ax_a = plt.subplots(nrows=1, ncols=3, figsize=(FIGSIZE * 3, FIGSIZE), squeeze=False)
 
@@ -672,7 +646,6 @@ def experiment_2_robust_opinion_seeding_random_scenarios(args: argparse.Namespac
         df_delta = pd.DataFrame(df_delta)
         df_delta.to_csv(f'{out_dir}/experiment_2_robust_opinion_seeding_random_scenarios_delta.csv', index=False)
 
-    # plot percent change in benefit
     num_names = concat_df['Name'].nunique()
     fig_a, ax_a = plt.subplots(nrows=1, ncols=3, figsize=(FIGSIZE * 3, FIGSIZE), squeeze=False)
 
@@ -701,7 +674,6 @@ def experiment_4_robust_opinion_seeding_active_set(args: argparse.Namespace) -> 
     out_dir = args.out_dir
 
     datasets = get_datasets(args)
-    # datasets = [('twitter', ['spectral'])]
 
     if args.cached_results:
         concat_df_inner = pd.read_csv(f'{out_dir}/experiment_4_robust_opinion_seeding_active_set_inner.csv')
@@ -772,7 +744,8 @@ def experiment_4_robust_opinion_seeding_active_set(args: argparse.Namespace) -> 
         df_delta.to_csv(f'{out_dir}/experiment_4_robust_opinion_seeding_active_set_delta.csv', index=False)
 
     fig_a, ax_a = plt.subplots(nrows=1, ncols=3, figsize=(FIGSIZE * 3, FIGSIZE), squeeze=False)
-    concat_df_inner_benefit = concat_df_inner[concat_df_inner['k'] == concat_df_inner['k'].max()]
+    
+    concat_df_inner_benefit = concat_df_inner.groupby('Name').apply(lambda x: x[x['k'] == x['k'].max()])
 
     sns.lineplot(x='Step', y='Objective Value', hue='Name', data=concat_df_inner_benefit, ax=ax_a[0, 0], markers=True, marker='o', markersize=5)
     ax_a[0, 0].set_xlabel('Step')
