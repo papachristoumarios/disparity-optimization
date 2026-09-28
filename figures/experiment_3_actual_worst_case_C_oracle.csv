@@ -1,0 +1,61 @@
+Name,Nominal Partition Type,Rho,Metric,Value,Number of Nodes
+reddit,spectral,0.1,Disparity,3.610616399597044,553
+reddit,spectral,0.1,Surrogate,1.0260031061797166,553
+reddit,spectral,0.1,Time (s),22.67465376853943,553
+reddit,spectral,0.1,Per Step Time (s),0.2290369067529235,553
+reddit,spectral,0.2,Disparity,6.4187987516827585,553
+reddit,spectral,0.2,Surrogate,1.8239668142413437,553
+reddit,spectral,0.2,Time (s),20.247368812561035,553
+reddit,spectral,0.2,Per Step Time (s),0.20451887689455592,553
+reddit,spectral,0.3,Disparity,8.42460321112305,553
+reddit,spectral,0.3,Surrogate,2.393920211671587,553
+reddit,spectral,0.3,Time (s),21.458253622055054,553
+reddit,spectral,0.3,Per Step Time (s),0.21675003658641467,553
+reddit,spectral,0.4,Disparity,9.628069861078977,553
+reddit,spectral,0.4,Surrogate,2.7358839943108193,553
+reddit,spectral,0.4,Time (s),20.723636150360107,553
+reddit,spectral,0.4,Per Step Time (s),0.20932965808444554,553
+reddit,spectral,0.5,Disparity,10.029222740649079,553
+reddit,spectral,0.5,Surrogate,2.8498705474908634,553
+reddit,spectral,0.5,Time (s),19.853281259536743,553
+reddit,spectral,0.5,Per Step Time (s),0.20053819454077518,553
+twitter,spectral,0.1,Disparity,0.5932497154131181,548
+twitter,spectral,0.1,Surrogate,0.502714435135357,548
+twitter,spectral,0.1,Time (s),18.135595083236694,548
+twitter,spectral,0.1,Per Step Time (s),0.18318782912360299,548
+twitter,spectral,0.2,Disparity,1.0544970324022498,548
+twitter,spectral,0.2,Surrogate,0.893501116480709,548
+twitter,spectral,0.2,Time (s),17.989378690719604,548
+twitter,spectral,0.2,Per Step Time (s),0.1817108958658546,548
+twitter,spectral,0.3,Disparity,1.3838691653647215,548
+twitter,spectral,0.3,Surrogate,1.1725205817897133,548
+twitter,spectral,0.3,Time (s),18.184640884399414,548
+twitter,spectral,0.3,Per Step Time (s),0.18368324125655974,548
+twitter,spectral,0.4,Disparity,1.5814564554957085,548
+twitter,spectral,0.4,Surrogate,1.3398868410509615,548
+twitter,spectral,0.4,Time (s),18.53252673149109,548
+twitter,spectral,0.4,Per Step Time (s),0.1871972397120312,548
+twitter,spectral,0.5,Disparity,1.64731289773262,548
+twitter,spectral,0.5,Surrogate,1.3956680372716614,548
+twitter,spectral,0.5,Time (s),17.576242685317993,548
+twitter,spectral,0.5,Per Step Time (s),0.17753780490220195,548
+polblogs,spectral,0.1,Disparity,7.288335301636599,1222
+polblogs,spectral,0.1,Surrogate,6.576284112312179,1222
+polblogs,spectral,0.1,Time (s),90.83763432502747,1222
+polblogs,spectral,0.1,Per Step Time (s),0.9175518618689643,1222
+polblogs,spectral,0.2,Disparity,12.955459231362035,1222
+polblogs,spectral,0.2,Surrogate,11.688763056678345,1222
+polblogs,spectral,0.2,Time (s),94.43327927589417,1222
+polblogs,spectral,0.2,Per Step Time (s),0.9538715078373148,1222
+polblogs,spectral,0.3,Disparity,17.002559764392743,1222
+polblogs,spectral,0.3,Surrogate,15.339245264722862,1222
+polblogs,spectral,0.3,Time (s),90.49147009849548,1222
+polblogs,spectral,0.3,Per Step Time (s),0.9140552535201564,1222
+polblogs,spectral,0.4,Disparity,19.430482604045107,1222
+polblogs,spectral,0.4,Surrogate,17.529019751568995,1222
+polblogs,spectral,0.4,Time (s),87.99882555007935,1222
+polblogs,spectral,0.4,Per Step Time (s),0.8888770257583772,1222
+polblogs,spectral,0.5,Disparity,20.239734027900926,1222
+polblogs,spectral,0.5,Surrogate,18.258858829268835,1222
+polblogs,spectral,0.5,Time (s),90.53323650360107,1222
+polblogs,spectral,0.5,Per Step Time (s),0.9144771364000108,1222
