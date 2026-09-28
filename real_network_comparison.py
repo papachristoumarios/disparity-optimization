@@ -129,8 +129,10 @@ def run(args):
 def write_table(df, corr, path):
     cols = [("n", "$n$", "{:d}"), ("m", "$m$", "{:d}"), ("lambda_2", "$\\lambda_2$", "{:.2f}"),
             ("size_imbalance", "Size imb.", "{:.2f}"), ("volume_imbalance", "Vol. imb.", "{:.2f}"),
-            ("modularity", "$Q$", "{:.2f}"), ("polarization", "$\\mathcal P$", "{:.3f}"),
-            ("cross_edge_fraction", "Cross-edge frac.", "{:.2f}"), ("disparity_rho=0.1", "$g(\\rho{=}0.1)$", "{:.3f}"),
+            ("modularity", "$Q$", "{:.2f}"), ("assortativity", "Assort.", "{:.2f}"),
+            ("cross_edge_fraction", "Cross-edge frac.", "{:.2f}"),
+            ("polarization", "$\\mathcal P$", "{:.3f}"), ("disagreement", "Disagr.", "{:.3f}"),
+            ("disparity_rho=0.1", "$g(\\rho{=}0.1)$", "{:.3f}"),
             ("ratio_rho=0.1", "$R(\\rho{=}0.1)$", "{:.1f}")]
     lines = ["\\begin{tabular}{ll" + "r" * len(cols) + "}", "\\toprule",
              "Network & Labels & " + " & ".join(c[1] for c in cols) + " \\\\", "\\midrule"]
