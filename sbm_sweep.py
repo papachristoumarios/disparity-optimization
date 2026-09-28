@@ -8,8 +8,8 @@ Sweep 2 (imbalance): fixed mixing ratio, vary the size of group A from 50% to
 90% of the users. Reports the same metrics together with group-size and
 group-volume imbalance statistics.
 
-Outputs: outputs/sbm_sweep_mixing.csv, outputs/sbm_sweep_imbalance.csv and
-figures/experiment_10_sbm_sweep.pdf
+Outputs (all under figures/): sbm_sweep_mixing.csv, sbm_sweep_imbalance.csv,
+experiment_10_sbm_sweep.pdf and experiment_10_sbm_sweep_main.pdf
 """
 from __future__ import annotations
 
@@ -218,6 +218,6 @@ if __name__ == "__main__":
     ap.add_argument("--imbalance_mixing", type=float, default=0.1)
     ap.add_argument("--num_points", type=int, default=9)
     ap.add_argument("--seeds", type=int, default=5)
-    ap.add_argument("--out-dir", dest="out_dir", default="outputs")
+    ap.add_argument("--out-dir", dest="out_dir", default="figures")
     ap.add_argument("--fig-dir", dest="fig_dir", default="figures")
     run(ap.parse_args())

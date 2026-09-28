@@ -7,8 +7,8 @@ disparity for several classifier errors rho, the structural disparity
 h(L, C(rho)) = lambda_max(M * C(rho)), and group-structure statistics that a
 platform could compute without any opinion dynamics.
 
-Outputs: outputs/real_network_comparison.csv, outputs/real_network_correlations.csv,
-figures/experiment_11_real_networks.pdf, figures/experiment_11_real_networks.tex
+Outputs (all under figures/): real_network_comparison.csv, real_network_correlations.csv,
+experiment_11_real_networks.pdf and experiment_11_real_networks.tex
 """
 from __future__ import annotations
 
@@ -232,7 +232,7 @@ def plot(df, path):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out-dir", dest="out_dir", default="outputs")
+    ap.add_argument("--out-dir", dest="out_dir", default="figures")
     ap.add_argument("--fig-dir", dest="fig_dir", default="figures")
     ap.add_argument("--from-csv", dest="from_csv", action="store_true", help="re-plot from the saved CSV")
     run(ap.parse_args())
