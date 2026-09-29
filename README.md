@@ -1,7 +1,7 @@
 # Disparity optimization
 
 Code and data for reproducing the experiments in *Quantifying and Mitigating Consensus
-Disparity in Social and Information Networks*. There are four entry points:
+Disparity in Social and Information Networks* [[link]](https://papers.ssrn.com/sol3/Delivery.cfm/7010678.pdf?abstractid=7010678&mirid=1). There are four entry points:
 
 | Script | Produces |
 |--------|----------|
